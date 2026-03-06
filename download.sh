@@ -226,6 +226,12 @@ extract_with_cdp() {
       err "Page took too long to load"
       return 1
     fi
+    if echo "$errmsg" | grep -qi "CAPTCHA_REQUIRED"; then
+      err "This site requires a captcha"
+      warn "Export cookies from your browser and use: snatch -c cookies.txt '$url'"
+      warn "Tip: use a browser extension like 'Get cookies.txt LOCALLY' to export cookies"
+      return 1
+    fi
   fi
 
   if [ -z "$result" ]; then

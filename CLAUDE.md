@@ -28,7 +28,10 @@ Two files: a bash orchestrator and a Node.js CDP extractor.
 - Cookie injection: parses Netscape-format cookie files, injects via `Network.setCookie`
 - Network interception: `Network.responseReceived` + `Network.requestWillBeSent`
 - Smart page load: waits for `Page.loadEventFired` (with TIMEOUT fallback) + 2s grace period
-- Auto-click: consent banners (14 selectors) and play buttons (9 selectors)
+- Anti-bot: user-agent override, `navigator.webdriver` spoofing, ad domain blocking via `Network.setBlockedURLs`
+- Auto-click: consent banners (14 selectors), play buttons (9 selectors), and server/source selection buttons
+- Server button clicking: tries `startPlayer()`, onclick handlers matching streaming patterns, `[data-server]`/`[data-value*="server"]` elements
+- Captcha detection: detects captcha forms after server click, outputs `CAPTCHA_REQUIRED` on stderr
 - DOM extraction: JWPlayer, Video.js, Plyr, Flowplayer, Clappr, hls.js, dash.js, HTML5 video/audio, iframes
 - If no URLs found: polls 6x every 1.5s (network + DOM re-extraction)
 - URL filtering: extended `isVideoUrl` patterns (chunklist, media, /hls/, /dash/), junk filter (analytics, tracking pixels)

@@ -153,9 +153,13 @@ function launchChrome() {
     '--disable-dev-shm-usage',
     '--disable-web-security',
     '--disable-features=VizDisplayCompositor',
+    '--disable-blink-features=AutomationControlled',
     `--user-data-dir=${CHROME_PROFILE}`,
     '--remote-debugging-port=0',
     '--mute-audio',
+    '--window-size=1920,1080',
+    '--block-new-web-contents',
+    '--disable-popup-blocking=false',
     'about:blank',
   ];
 
@@ -428,6 +432,39 @@ async function extract() {
   await send('Page.enable');
   await send('Runtime.enable');
 
+  // Block ad/tracking domains that cause redirects in headless mode
+  await send('Network.setBlockedURLs', {
+    urls: [
+      '*protrafficinspector*',
+      '*hotelkobalts*',
+      '*clickdir*',
+      '*runoperagx*',
+      '*googlesyndication*',
+      '*doubleclick*',
+      '*ezexfzek*',
+      '*addthis*',
+      '*google-analytics*',
+      '*facebook.com/tr*',
+      '*nn125.com*',
+    ],
+  });
+
+  // Hide headless Chrome signals to bypass bot detection
+  await send('Network.setUserAgentOverride', {
+    userAgent:
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  });
+  await send('Page.addScriptToEvaluateOnNewDocument', {
+    source: `
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+      window.chrome = { runtime: {} };
+      // Block ad-driven window.open and popups
+      window.open = () => null;
+    `,
+  });
+
   // Inject cookies if provided
   if (COOKIES_FILE) {
     const cookies = parseCookiesFile(COOKIES_FILE);
@@ -554,6 +591,77 @@ async function extract() {
     }
   } catch (e) {
     console.error('DOM_EXTRACT_ERROR:' + e.message);
+  }
+
+  // Try clicking server/source selection buttons that trigger video loading
+  // Many streaming sites load video only after user clicks a server button
+  if (videoUrls.size === 0 || [...videoUrls].every((u) => u.startsWith('IFRAME:'))) {
+    debug('Trying to click server/source buttons...');
+    try {
+      const serverClickResult = await browser.evaluate(
+        sessionId,
+        `(function() {
+          const clicked = [];
+          // Try calling startPlayer() if it exists (common pattern)
+          if (typeof startPlayer === 'function') {
+            try { startPlayer(); clicked.push('startPlayer()'); } catch(e) {}
+          }
+          // Click elements with onclick handlers related to streaming/servers
+          if (clicked.length === 0) {
+            const allClickable = document.querySelectorAll('[onclick]');
+            for (const el of allClickable) {
+              const handler = el.getAttribute('onclick') || '';
+              if (/getStream|getLink|loadServer|selectServer|playVideo|loadVideo/i.test(handler)) {
+                try { el.click(); clicked.push('onclick:' + handler.substring(0, 60)); break; } catch(e) {}
+              }
+            }
+          }
+          // Click server list items (common pattern: list items in a server container)
+          if (clicked.length === 0) {
+            const serverItems = document.querySelectorAll(
+              '[data-server], [data-value*="server"], [class*="server"] li, [data-box*="serv"] ~ * li'
+            );
+            for (const el of serverItems) {
+              if (el.offsetParent !== null) {
+                try { el.click(); clicked.push('server-item:' + el.textContent.trim().substring(0, 30)); break; } catch(e) {}
+              }
+            }
+          }
+          return JSON.stringify(clicked);
+        })()`
+      );
+      const serverClicked = JSON.parse(serverClickResult || '[]');
+      if (serverClicked.length > 0) {
+        debug('Server buttons clicked:', serverClicked);
+        // Wait for AJAX + player initialization
+        await new Promise((r) => setTimeout(r, 5000));
+
+        // Check if a captcha appeared (common on streaming sites)
+        try {
+          const hasCaptcha = await browser.evaluate(
+            sessionId,
+            `!!(document.querySelector('#player-captcha, [id*="captcha"], .g-recaptcha, .h-captcha, [class*="captcha"]'))`
+          );
+          if (hasCaptcha) {
+            console.error('CAPTCHA_REQUIRED: site requires captcha, use -c/--cookies with exported browser cookies');
+          }
+        } catch {}
+
+        // Re-extract from DOM (iframes, video elements, player APIs)
+        try {
+          const domResult = await browser.evaluate(sessionId, DOM_EXTRACT_SCRIPT);
+          const extracted = JSON.parse(domResult || '[]');
+          debug('Post-server-click DOM extracted:', extracted.length, 'URLs');
+          for (const u of extracted) {
+            if (u && !isJunk(u)) videoUrls.add(u);
+          }
+        } catch (e) {
+          debug('Post-server-click DOM extraction error:', e.message);
+        }
+      }
+    } catch (e) {
+      debug('Server click error:', e.message);
+    }
   }
 
   // If nothing found yet, poll with shorter intervals

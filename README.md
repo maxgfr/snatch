@@ -61,6 +61,28 @@ snatch -d 'https://stubborn-site.com/video'
 2. **CDP fallback** - if yt-dlp fails, launches headless Chrome via raw Chrome DevTools Protocol, intercepts network requests to find video URLs (m3u8, mp4, mpd), extracts from player APIs (JWPlayer, Video.js, Plyr, Flowplayer, Clappr, hls.js, dash.js), and auto-clicks consent/play buttons
 3. **Download** - downloads the extracted URL via yt-dlp, curl (mp4), or ffmpeg (m3u8/mpd), with Referer header for CDN compatibility
 
+## Captcha-protected sites
+
+Some streaming sites (e.g. 123movies) require solving a captcha before serving video. Snatch detects this and tells you to use cookies:
+
+```
+[err] This site requires a captcha
+[!!] Export cookies from your browser and use: snatch -c cookies.txt '<URL>'
+```
+
+**How to fix it:**
+
+1. Install a cookie export extension in your browser (e.g. [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc))
+2. Visit the site in your browser, solve the captcha, and start playing the video
+3. Export cookies to a `cookies.txt` file (Netscape format)
+4. Run snatch with the `-c` flag:
+
+```bash
+snatch -c cookies.txt 'https://example.com/video-page'
+```
+
+The cookies provide your authenticated session so snatch can bypass the captcha.
+
 ## Supported sites
 
 Everything yt-dlp supports (1800+ sites), plus any site that loads video via standard HTML5 players or streaming protocols — even those that try to hide their video URLs.

@@ -24,9 +24,7 @@ chmod +x download.sh
 ## Usage
 
 ```bash
-snatch 'https://youtube.com/watch?v=dQw4w9WgXcQ'
-snatch -o my_video 'https://voe.sx/e/abc123'
-snatch 'https://absolutondemand.de/film/das-neue-babylon-1929/'
+snatch https://youtube.com/watch?v=dQw4w9WgXcQ
 ```
 
 Options:
@@ -66,15 +64,6 @@ snatch -d 'https://stubborn-site.com/video'
 ## Supported sites
 
 Everything yt-dlp supports (1800+ sites), plus any site that loads video via standard HTML5 players or streaming protocols — even those that try to hide their video URLs.
-
-## Dependencies
-
-Installed automatically via Homebrew:
-
-- [yt-dlp](https://github.com/yt-dlp/yt-dlp) - video downloader
-- [ffmpeg](https://ffmpeg.org/) - media processing
-- [fnm](https://github.com/Schniz/fnm) - fast Node.js manager (rust-based)
-- [Node.js](https://nodejs.org/) - for CDP browser extraction
 
 ## License
 

@@ -7,7 +7,7 @@ set -euo pipefail
 # Dependencies managed via brew (fnm, uv, ffmpeg, yt-dlp)
 # ============================================================================
 
-VERSION="0.0.0"
+VERSION="1.0.0"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 EXTRACT_SCRIPT="$SCRIPT_DIR/extract_video_url.mjs"

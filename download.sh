@@ -4,7 +4,7 @@ set -euo pipefail
 # ============================================================================
 # snatch - Universal video downloader
 # Tries yt-dlp first, falls back to CDP-based browser extraction
-# Dependencies managed via brew (fnm, ffmpeg, yt-dlp)
+# Dependencies managed via brew (node, ffmpeg, yt-dlp)
 # ============================================================================
 
 VERSION="1.3.0"
@@ -126,17 +126,7 @@ ensure_deps() {
   check_brew
   ensure_dep ffmpeg
   ensure_dep yt-dlp
-
-  # Node.js: use existing node, or install via fnm
-  if ! command -v node &>/dev/null; then
-    ensure_dep fnm
-    eval "$(fnm env --shell bash 2>/dev/null)" || true
-    if ! command -v node &>/dev/null; then
-      log "Installing Node.js via fnm..."
-      fnm install --lts
-      eval "$(fnm env --shell bash)"
-    fi
-  fi
+  ensure_dep node
 
   if [ ! -d "$NODE_PROJECT/node_modules/ws" ]; then
     log "Installing ws dependency..."

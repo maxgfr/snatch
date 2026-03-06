@@ -6,7 +6,7 @@ Two files: a bash orchestrator and a Node.js CDP extractor.
 
 ### `download.sh` — Main CLI
 - `VERSION` at top (bumped by semantic-release via `.version-hook.sh`)
-- Deps auto-installed via brew: `fnm`, `ffmpeg`, `yt-dlp`, Node.js via fnm
+- Deps auto-installed via brew: `node`, `ffmpeg`, `yt-dlp`
 - Flags: `-o/--output`, `-q/--quality`, `-c/--cookies`, `-n/--dry-run`, `-d/--verbose`, `-h/--help`, `-v/--version`
 - All options requiring a value have safe `$# -lt 2` check
 - Shared yt-dlp args built via `build_ytdlp_args()` (output, quality, cookies)
@@ -70,7 +70,3 @@ When installed via `brew install maxgfr/tap/snatch`:
 - Color output: red=error, green=ok, yellow=warn, blue=info
 - Debug output only when `VERBOSE=true` / `SNATCH_VERBOSE=1`
 - No external deps except `ws` npm package
-
-## Reference repos
-- https://github.com/maxgfr/copyable-pdf — release/CI pattern
-- https://github.com/maxgfr/leboncoin-cdp-scraper — CDP pattern

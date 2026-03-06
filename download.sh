@@ -4,7 +4,7 @@ set -euo pipefail
 # ============================================================================
 # snatch - Universal video downloader
 # Tries yt-dlp first, falls back to CDP-based browser extraction
-# Dependencies managed via brew (fnm, uv, ffmpeg, yt-dlp)
+# Dependencies managed via brew (fnm, ffmpeg, yt-dlp)
 # ============================================================================
 
 VERSION="1.0.0"
@@ -87,7 +87,6 @@ ensure_dep() {
 ensure_deps() {
   check_brew
   ensure_dep fnm
-  ensure_dep uv
   ensure_dep ffmpeg
   ensure_dep yt-dlp
 

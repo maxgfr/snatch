@@ -54,7 +54,7 @@ Installed automatically via Homebrew:
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) - video downloader
 - [ffmpeg](https://ffmpeg.org/) - media processing
 - [fnm](https://github.com/Schniz/fnm) - fast Node.js manager (rust-based)
-- [uv](https://github.com/astral-sh/uv) - Python package manager (rust-based)
+- [Node.js](https://nodejs.org/) - for CDP browser extraction
 
 ## License
 

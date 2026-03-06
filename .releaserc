@@ -1,0 +1,10 @@
+{
+  "branches": ["main"],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    "@semantic-release/release-notes-generator",
+    ["@semantic-release/exec", { "prepareCmd": "bash .version-hook.sh ${nextRelease.version}" }],
+    ["@semantic-release/git", { "assets": ["download.sh"], "message": "chore(release): ${nextRelease.version}" }],
+    "@semantic-release/github"
+  ]
+}

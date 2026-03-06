@@ -1,0 +1,10 @@
+{
+  "name": "snatch",
+  "version": "0.0.0",
+  "type": "module",
+  "license": "MIT",
+  "author": "maxgfr",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

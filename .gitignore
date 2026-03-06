@@ -1,0 +1,6 @@
+node_modules/
+*.mp4
+*.mkv
+*.webm
+*.ts
+!extract_video_url.mjs

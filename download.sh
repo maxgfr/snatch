@@ -19,12 +19,29 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-log()  { echo -e "${BLUE}[snatch]${NC} $*" >&2; }
-ok()   { echo -e "${GREEN}[ok]${NC} $*" >&2; }
-warn() { echo -e "${YELLOW}[!!]${NC} $*" >&2; }
-err()  { echo -e "${RED}[err]${NC} $*" >&2; }
-
 OUTPUT=""
+DRY_RUN=false
+VERBOSE=false
+COOKIES=""
+QUALITY=""
+
+# --- Cleanup ---------------------------------------------------------------
+
+TMPFILES=()
+cleanup() {
+  for f in "${TMPFILES[@]}"; do
+    rm -f "$f"
+  done
+}
+trap cleanup EXIT
+
+# --- Logging ---------------------------------------------------------------
+
+log()   { echo -e "${BLUE}[snatch]${NC} $*" >&2; }
+ok()    { echo -e "${GREEN}[ok]${NC} $*" >&2; }
+warn()  { echo -e "${YELLOW}[!!]${NC} $*" >&2; }
+err()   { echo -e "${RED}[err]${NC} $*" >&2; }
+debug() { $VERBOSE && echo -e "${BLUE}[debug]${NC} $*" >&2 || true; }
 
 # --- Usage -----------------------------------------------------------------
 
@@ -36,15 +53,26 @@ Usage: snatch [options] <URL>
 
 Options:
   -o, --output <name>   Output filename (without extension)
+  -q, --quality <fmt>   Quality/format selector (passed to yt-dlp -f)
+  -c, --cookies <file>  Cookies file (Netscape format, passed to yt-dlp & CDP)
+  -n, --dry-run         Extract video URLs without downloading
+  -d, --verbose         Enable verbose/debug output
   -h, --help            Show this help
   -v, --version         Show version
 
 Examples:
   snatch 'https://youtube.com/watch?v=dQw4w9WgXcQ'
   snatch -o my_video 'https://voe.sx/e/abc123'
-  snatch 'https://absolutondemand.de/film/das-neue-babylon-1929/'
+  snatch -n 'https://example.com/video'
+  snatch -q 'bestvideo[height<=720]+bestaudio' 'https://youtube.com/watch?v=...'
+  snatch -c cookies.txt 'https://premium-site.com/video'
 EOF
   exit 0
+}
+
+usage_short() {
+  err "Run 'snatch --help' for usage."
+  exit 1
 }
 
 # --- Argument parsing ------------------------------------------------------
@@ -56,14 +84,24 @@ parse_args() {
     case "$1" in
       -h|--help) usage ;;
       -v|--version) echo "snatch $VERSION"; exit 0 ;;
-      -o|--output) OUTPUT="$2"; shift 2 ;;
-      -*) err "Unknown option: $1"; usage ;;
+      -o|--output)
+        if [[ $# -lt 2 ]]; then err "Missing value for $1"; exit 1; fi
+        OUTPUT="$2"; shift 2 ;;
+      -q|--quality)
+        if [[ $# -lt 2 ]]; then err "Missing value for $1"; exit 1; fi
+        QUALITY="$2"; shift 2 ;;
+      -c|--cookies)
+        if [[ $# -lt 2 ]]; then err "Missing value for $1"; exit 1; fi
+        COOKIES="$2"; shift 2 ;;
+      -n|--dry-run) DRY_RUN=true; shift ;;
+      -d|--verbose) VERBOSE=true; shift ;;
+      -*) err "Unknown option: $1"; usage_short ;;
       *) URL="$1"; shift ;;
     esac
   done
   if [[ -z "$URL" ]]; then
-    err "Missing URL"
-    usage
+    err "Missing URL. Run 'snatch --help' for usage."
+    exit 1
   fi
 }
 
@@ -86,21 +124,44 @@ ensure_dep() {
 
 ensure_deps() {
   check_brew
-  ensure_dep fnm
   ensure_dep ffmpeg
   ensure_dep yt-dlp
 
-  eval "$(fnm env --shell bash 2>/dev/null)" || true
+  # Node.js: use existing node, or install via fnm
   if ! command -v node &>/dev/null; then
-    log "Installing Node.js via fnm..."
-    fnm install --lts
-    eval "$(fnm env --shell bash)"
+    ensure_dep fnm
+    eval "$(fnm env --shell bash 2>/dev/null)" || true
+    if ! command -v node &>/dev/null; then
+      log "Installing Node.js via fnm..."
+      fnm install --lts
+      eval "$(fnm env --shell bash)"
+    fi
   fi
 
-  # Ensure ws is installed for CDP extraction
   if [ ! -d "$NODE_PROJECT/node_modules/ws" ]; then
     log "Installing ws dependency..."
     (cd "$NODE_PROJECT" && npm install --silent) 2>&1 | tail -1 >&2
+  fi
+}
+
+# --- Common yt-dlp args ---------------------------------------------------
+
+build_ytdlp_args() {
+  local -n _arr=$1
+  _arr=(
+    --no-check-certificates
+    --no-warnings
+    --progress
+    --concurrent-fragments 4
+  )
+  if [ -n "$OUTPUT" ]; then
+    _arr+=(-o "${OUTPUT}.%(ext)s")
+  fi
+  if [ -n "$QUALITY" ]; then
+    _arr+=(-f "$QUALITY")
+  fi
+  if [ -n "$COOKIES" ]; then
+    _arr+=(--cookies "$COOKIES")
   fi
 }
 
@@ -110,18 +171,12 @@ try_ytdlp() {
   local url="$1"
   log "Trying yt-dlp..."
 
-  local ytdlp_args=(
-    --no-check-certificates
-    --no-warnings
-    --progress
-    --concurrent-fragments 4
-  )
+  local ytdlp_args=()
+  build_ytdlp_args ytdlp_args
 
-  if [ -n "$OUTPUT" ]; then
-    ytdlp_args+=(-o "${OUTPUT}.%(ext)s")
-  fi
+  debug "yt-dlp ${ytdlp_args[*]} $url"
 
-  if yt-dlp "${ytdlp_args[@]}" "$url" 2>&1; then
+  if yt-dlp "${ytdlp_args[@]}" "$url"; then
     return 0
   fi
   return 1
@@ -131,15 +186,29 @@ extract_with_cdp() {
   local url="$1"
   log "yt-dlp failed, extracting video URL with CDP..."
 
-  local result stderr_output
+  local stderr_output
   stderr_output=$(mktemp)
-  result=$(node "$EXTRACT_SCRIPT" "$url" 2>"$stderr_output") || true
+  TMPFILES+=("$stderr_output")
 
-  # Check stderr for specific errors
+  local env_args=()
+  if $VERBOSE; then env_args+=(SNATCH_VERBOSE=1); fi
+  if [ -n "$COOKIES" ]; then env_args+=(SNATCH_COOKIES="$COOKIES"); fi
+
+  local result
+  if [ ${#env_args[@]} -gt 0 ]; then
+    result=$(env "${env_args[@]}" node "$EXTRACT_SCRIPT" "$url" 2>"$stderr_output") || true
+  else
+    result=$(node "$EXTRACT_SCRIPT" "$url" 2>"$stderr_output") || true
+  fi
+
   if [ -f "$stderr_output" ]; then
     local errmsg
     errmsg=$(cat "$stderr_output")
-    rm -f "$stderr_output"
+
+    if $VERBOSE && [ -n "$errmsg" ]; then
+      debug "CDP stderr output:"
+      echo "$errmsg" >&2
+    fi
 
     if echo "$errmsg" | grep -qi "401\|403\|unauthorized\|forbidden"; then
       err "This site requires authentication"
@@ -177,7 +246,11 @@ extract_with_cdp() {
       iframe_url="${base}${iframe_url}"
     fi
     warn "Found embedded iframe, extracting from: $iframe_url"
-    result=$(node "$EXTRACT_SCRIPT" "$iframe_url" 2>/dev/null) || true
+    if [ ${#env_args[@]} -gt 0 ]; then
+      result=$(env "${env_args[@]}" node "$EXTRACT_SCRIPT" "$iframe_url" 2>/dev/null) || true
+    else
+      result=$(node "$EXTRACT_SCRIPT" "$iframe_url" 2>/dev/null) || true
+    fi
     if [ -z "$result" ]; then
       return 1
     fi
@@ -194,19 +267,16 @@ extract_with_cdp() {
 
 download_extracted_url() {
   local video_url="$1"
+  local referer="$URL"
 
-  local ytdlp_args=(
-    --no-check-certificates
-    --no-warnings
-    --progress
-    --concurrent-fragments 4
-  )
-  if [ -n "$OUTPUT" ]; then
-    ytdlp_args+=(-o "${OUTPUT}.%(ext)s")
-  fi
+  local ytdlp_args=()
+  build_ytdlp_args ytdlp_args
+  ytdlp_args+=(--referer "$referer")
+
+  debug "Downloading extracted URL: $video_url (referer: $referer)"
 
   # Try yt-dlp on the extracted URL first (handles m3u8 well)
-  if yt-dlp "${ytdlp_args[@]}" "$video_url" 2>&1; then
+  if yt-dlp "${ytdlp_args[@]}" "$video_url"; then
     return 0
   fi
 
@@ -214,7 +284,7 @@ download_extracted_url() {
   if [[ "$video_url" == *.mp4* ]]; then
     local fname="${OUTPUT:-video}.mp4"
     log "Falling back to curl..."
-    curl -L --progress-bar -o "$fname" "$video_url"
+    curl -L --progress-bar -o "$fname" -e "$referer" "$video_url"
     return $?
   fi
 
@@ -222,7 +292,7 @@ download_extracted_url() {
   if [[ "$video_url" == *m3u8* ]] || [[ "$video_url" == *mpd* ]]; then
     local fname="${OUTPUT:-video}.mp4"
     log "Falling back to ffmpeg..."
-    ffmpeg -y -i "$video_url" -c copy -bsf:a aac_adtstoasc "$fname" 2>&1 | tail -5
+    ffmpeg -y -headers "Referer: ${referer}"$'\r\n' -i "$video_url" -c copy -bsf:a aac_adtstoasc "$fname" 2>&1 | tail -5
     return $?
   fi
 
@@ -236,6 +306,31 @@ main() {
   local url="$URL"
 
   ensure_deps
+
+  # Dry-run mode: extract URLs without downloading
+  if $DRY_RUN; then
+    log "Dry-run mode: extracting URLs only"
+
+    local ytdlp_urls=""
+    ytdlp_urls=$(yt-dlp --no-check-certificates --no-warnings -g "$url" 2>/dev/null) || true
+
+    local extracted=""
+    extracted=$(extract_with_cdp "$url") || true
+
+    if [ -n "$ytdlp_urls" ]; then
+      log "URLs from yt-dlp:"
+      echo "$ytdlp_urls"
+    fi
+    if [ -n "$extracted" ]; then
+      log "URLs from CDP extraction:"
+      echo "$extracted"
+    fi
+    if [ -z "$ytdlp_urls" ] && [ -z "$extracted" ]; then
+      err "No video URL found on this page"
+      exit 1
+    fi
+    exit 0
+  fi
 
   # Step 1: Try yt-dlp directly
   if try_ytdlp "$url"; then

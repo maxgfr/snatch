@@ -7,8 +7,8 @@ Universal video downloader. Tries yt-dlp first, falls back to CDP-based browser 
 ## Install
 
 ```bash
-brew tap maxgfr/tap
 brew install maxgfr/tap/snatch
+snatch --help
 ```
 
 Or manually:

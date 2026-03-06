@@ -197,11 +197,11 @@ const isVideoUrl = (u) =>
   /\.(m3u8|mp4|webm|mkv|ts|mpd)(\?|$|&)/i.test(u) ||
   /master\.m3u8|index\.m3u8|playlist\.m3u8|chunklist.*\.m3u8|media.*\.m3u8/i.test(u) ||
   /manifest\.mpd|video.*\.mp4/i.test(u) ||
-  /\/hls\/|\/dash\/|\/video\//i.test(u);
+  /\/hls\/|\/dash\//i.test(u);
 
 const isJunk = (u) =>
   /test-videos\.co\.uk|blob:/i.test(u) ||
-  /\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ico|json|xml)(\?|$)/i.test(u) ||
+  /\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ico|json|xml|html)(\?|$)/i.test(u) ||
   /google-analytics|googlesyndication|doubleclick|facebook\.com\/tr|analytics/i.test(u);
 
 const isVideoContentType = (ct) =>
@@ -215,6 +215,33 @@ const isVideoContentType = (ct) =>
 
 const DOM_EXTRACT_SCRIPT = `(function() {
   const results = [];
+  // THEOplayer
+  try {
+    document.querySelectorAll('.theoplayer-container, .video-js, [class*="theoplayer"]').forEach(el => {
+      if (el.player && el.player.source && el.player.source.sources) {
+        el.player.source.sources.forEach(s => { if (s.src) results.push(s.src); });
+      }
+    });
+    if (typeof THEOplayer !== 'undefined') {
+      document.querySelectorAll('div').forEach(el => {
+        try {
+          if (el.player && el.player.src) results.push(el.player.src);
+        } catch(e) {}
+      });
+    }
+  } catch(e) {}
+  // Look for video source URLs in inline scripts (THEOplayer, generic player configs)
+  try {
+    document.querySelectorAll('script:not([src])').forEach(s => {
+      const t = s.textContent || '';
+      const m3u8s = t.match(/https?:\\/\\/[^'\"\\s]+\\.m3u8[^'\"\\s]*/g) || [];
+      const mpds = t.match(/https?:\\/\\/[^'\"\\s]+\\.mpd[^'\"\\s]*/g) || [];
+      const mp4s = t.match(/https?:\\/\\/[^'\"\\s]+\\.mp4[^'\"\\s]*/g) || [];
+      [...m3u8s, ...mpds, ...mp4s].forEach(u => {
+        if (!/tracking|analytics|pixel/i.test(u)) results.push(u);
+      });
+    });
+  } catch(e) {}
   // JWPlayer
   if (typeof jwplayer !== 'undefined') {
     try {
@@ -416,11 +443,26 @@ async function extract() {
     }
   }
 
+  // Track video-looking URLs that turned out to be HTML (player/preview pages)
+  const htmlPlayerPages = new Set();
+
   // Collect video URLs from network
   browser.on('Network.responseReceived', (params) => {
     const u = params.response?.url || '';
     const ct = params.response?.headers?.['content-type'] || params.response?.mimeType || '';
     if (isJunk(u)) return;
+    // Skip HTML responses even if URL looks like a video (e.g. preview pages)
+    if (/text\/html/i.test(ct)) {
+      debug('Skipping HTML response:', u);
+      // Remove if requestWillBeSent already added it
+      if (videoUrls.has(u)) {
+        videoUrls.delete(u);
+        debug('Removed fake video URL (HTML):', u);
+      }
+      // Track as potential player page to follow later
+      if (isVideoUrl(u)) htmlPlayerPages.add(u);
+      return;
+    }
     if (isVideoUrl(u) || isVideoContentType(ct)) {
       debug('Network response:', u);
       videoUrls.add(u);
@@ -464,14 +506,39 @@ async function extract() {
   // Grace period for dynamic content after load
   await new Promise((r) => setTimeout(r, 2000));
 
+  // Extract from DOM and player APIs BEFORE clicking (in case click navigates away)
+  try {
+    const earlyResult = await browser.evaluate(sessionId, DOM_EXTRACT_SCRIPT);
+    const earlyUrls = JSON.parse(earlyResult || '[]');
+    debug('Early DOM extracted:', earlyUrls.length, 'URLs');
+    for (const u of earlyUrls) {
+      if (u && !isJunk(u)) videoUrls.add(u);
+    }
+  } catch (e) {
+    debug('Early DOM extraction error:', e.message);
+  }
+
   // Click consent banners and play buttons to trigger video loading
   try {
+    // Remember current URL to detect unwanted navigation
+    const beforeUrl = await browser.evaluate(sessionId, 'window.location.href');
     const clickResult = await browser.evaluate(sessionId, CLICK_CONSENT_AND_PLAY_SCRIPT);
     const clicked = JSON.parse(clickResult || '[]');
     if (clicked.length > 0) {
       debug('Clicked:', clicked);
       // Wait for video to start loading after click
       await new Promise((r) => setTimeout(r, 3000));
+      // Check if click caused unwanted navigation
+      try {
+        const afterUrl = await browser.evaluate(sessionId, 'window.location.href');
+        if (afterUrl !== beforeUrl) {
+          debug('Click caused navigation to:', afterUrl, '- navigating back');
+          await send('Page.navigate', { url: beforeUrl });
+          await new Promise((r) => setTimeout(r, 2000));
+        }
+      } catch (e) {
+        debug('Navigation check error:', e.message);
+      }
     }
   } catch (e) {
     debug('Click script error:', e.message);
@@ -483,7 +550,7 @@ async function extract() {
     const extracted = JSON.parse(domResult || '[]');
     debug('DOM extracted:', extracted.length, 'URLs');
     for (const u of extracted) {
-      if (!isJunk(u)) videoUrls.add(u);
+      if (u && !isJunk(u)) videoUrls.add(u);
     }
   } catch (e) {
     console.error('DOM_EXTRACT_ERROR:' + e.message);
@@ -506,13 +573,79 @@ async function extract() {
         const retryResult = await browser.evaluate(sessionId, DOM_EXTRACT_SCRIPT);
         const retryUrls = JSON.parse(retryResult || '[]');
         for (const u of retryUrls) {
-          if (!isJunk(u)) videoUrls.add(u);
+          if (u && !isJunk(u)) videoUrls.add(u);
         }
         if (videoUrls.size > 0) {
           debug('Found URLs on poll attempt', i + 1);
           break;
         }
       } catch {}
+    }
+  }
+
+  // Check if we only have iframes but no real video URLs
+  const realVideoUrls = [...videoUrls].filter((u) => !u.startsWith('IFRAME:'));
+  if (realVideoUrls.length === 0 && htmlPlayerPages.size > 0) {
+    const playerUrl = [...htmlPlayerPages][0];
+    debug('No video found, following player page:', playerUrl);
+    try {
+      // Create a new tab for the player page
+      const { targetId: playerTargetId } = await browser.send('Target.createTarget', { url: 'about:blank' });
+      const { sessionId: playerSessionId } = await browser.send('Target.attachToTarget', { targetId: playerTargetId, flatten: true });
+      const sendPlayer = (method, params = {}) => browser.sendToSession(playerSessionId, method, params);
+
+      await sendPlayer('Network.enable');
+      await sendPlayer('Page.enable');
+      await sendPlayer('Runtime.enable');
+
+      // Collect video URLs from the player page network
+      browser.on('Network.responseReceived', (params) => {
+        if (params.sessionId !== undefined && params.sessionId !== playerSessionId) return;
+        const u = params.response?.url || '';
+        const ct = params.response?.headers?.['content-type'] || params.response?.mimeType || '';
+        if (isJunk(u) || /text\/html/i.test(ct)) return;
+        if (isVideoUrl(u) || isVideoContentType(ct)) {
+          debug('Player page network response:', u);
+          videoUrls.add(u);
+        }
+      });
+
+      browser.on('Network.requestWillBeSent', (params) => {
+        if (params.sessionId !== undefined && params.sessionId !== playerSessionId) return;
+        const u = params.request?.url || '';
+        if (!isJunk(u) && isVideoUrl(u)) {
+          debug('Player page network request:', u);
+          videoUrls.add(u);
+        }
+      });
+
+      await sendPlayer('Page.navigate', { url: playerUrl });
+
+      // Wait for player page to load
+      await new Promise((resolve) => {
+        const onLoad = () => resolve();
+        browser.on('Page.loadEventFired', onLoad);
+        setTimeout(resolve, TIMEOUT);
+      });
+      await new Promise((r) => setTimeout(r, 2000));
+
+      // Extract from player page DOM (inline scripts, THEOplayer, etc.)
+      try {
+        const domResult = await browser.evaluate(playerSessionId, DOM_EXTRACT_SCRIPT);
+        const extracted = JSON.parse(domResult || '[]');
+        debug('Player page DOM extracted:', extracted.length, 'URLs');
+        for (const u of extracted) {
+          if (u && !isJunk(u)) videoUrls.add(u);
+        }
+      } catch (e) {
+        debug('Player page DOM extraction error:', e.message);
+      }
+
+      try {
+        await browser.send('Target.closeTarget', { targetId: playerTargetId });
+      } catch {}
+    } catch (e) {
+      debug('Failed to follow player page:', e.message);
     }
   }
 
@@ -523,7 +656,7 @@ async function extract() {
   browser.disconnect();
 
   // Output results (sorted by priority: m3u8 > mpd > mp4 > others)
-  const results = [...videoUrls];
+  const results = [...videoUrls].filter(Boolean);
   const iframes = results.filter((u) => u.startsWith('IFRAME:'));
   const videos = results.filter((u) => !u.startsWith('IFRAME:'));
 

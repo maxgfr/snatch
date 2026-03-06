@@ -285,6 +285,12 @@ download_extracted_url() {
     local fname="${OUTPUT:-video}.mp4"
     log "Falling back to curl..."
     curl -L --progress-bar -o "$fname" -e "$referer" "$video_url"
+    # Verify the downloaded file is actually a video, not HTML
+    if file "$fname" 2>/dev/null | grep -qi "html\|text"; then
+      warn "Downloaded file is HTML, not a video — URL may be a player page"
+      rm -f "$fname"
+      return 1
+    fi
     return $?
   fi
 

@@ -115,17 +115,37 @@ class CDPClient {
 // --- Find Chrome/Chromium -------------------------------------------------
 
 function findChrome() {
+  if (process.env.SNATCH_CHROME && existsSync(process.env.SNATCH_CHROME)) {
+    return process.env.SNATCH_CHROME;
+  }
   const paths = [
-    // macOS
+    // macOS - Chrome family
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
     '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
+    '/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta',
+    '/Applications/Google Chrome Dev.app/Contents/MacOS/Google Chrome Dev',
+    '/Applications/Chromium.app/Contents/MacOS/Chromium',
+    // macOS - other Chromium-based browsers (CDP-compatible)
+    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+    '/Applications/Brave Browser Beta.app/Contents/MacOS/Brave Browser Beta',
+    '/Applications/Brave Browser Nightly.app/Contents/MacOS/Brave Browser Nightly',
+    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    '/Applications/Microsoft Edge Beta.app/Contents/MacOS/Microsoft Edge Beta',
+    '/Applications/Microsoft Edge Dev.app/Contents/MacOS/Microsoft Edge Dev',
+    '/Applications/Arc.app/Contents/MacOS/Arc',
+    '/Applications/Vivaldi.app/Contents/MacOS/Vivaldi',
+    '/Applications/Opera.app/Contents/MacOS/Opera',
+    '/Applications/Thorium.app/Contents/MacOS/Thorium',
     // Linux
     '/usr/bin/google-chrome',
     '/usr/bin/google-chrome-stable',
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser',
+    '/usr/bin/brave-browser',
+    '/usr/bin/microsoft-edge',
+    '/usr/bin/vivaldi',
     '/snap/bin/chromium',
+    '/snap/bin/brave',
   ];
   for (const p of paths) {
     try {
@@ -133,12 +153,25 @@ function findChrome() {
       return p;
     } catch {}
   }
-  for (const cmd of ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser']) {
+  for (const cmd of [
+    'google-chrome',
+    'google-chrome-stable',
+    'chromium',
+    'chromium-browser',
+    'brave-browser',
+    'brave',
+    'microsoft-edge',
+    'vivaldi',
+  ]) {
     try {
-      return execSync(`which ${cmd}`, { stdio: 'pipe' }).toString().trim();
+      const found = execSync(`which ${cmd}`, { stdio: 'pipe' }).toString().trim();
+      if (found) return found;
     } catch {}
   }
-  throw new Error('Chrome/Chromium not found');
+  throw new Error(
+    'No Chromium-based browser found. Install Chrome, Chromium, Brave, Edge, Arc, or Vivaldi, ' +
+    'or set SNATCH_CHROME=/path/to/browser'
+  );
 }
 
 // --- Launch Chrome --------------------------------------------------------
@@ -203,10 +236,17 @@ const isVideoUrl = (u) =>
   /manifest\.mpd|video.*\.mp4/i.test(u) ||
   /\/hls\/|\/dash\//i.test(u);
 
+const AD_DOMAIN_RE = /(^|\/\/|\.)(vidwestxyz|adexchangeclear|adexchange|adnetwork|popads|popcash|propellerads|runoperagx|clickdir|clickadilla|hotelkobalts|protrafficinspector|ezexfzek|nn125|addthis|disqus|adskeeper|mgid|outbrain|taboola|googletagmanager|googlesyndication|googleadservices|doubleclick|adservice\.google|google-analytics|scorecardresearch|quantserve|hotjar|mixpanel|segment\.(io|com)|facebook\.com\/tr|bing\.com\/bat|yandex\.ru\/metrika)/i;
+
 const isJunk = (u) =>
-  /test-videos\.co\.uk|blob:/i.test(u) ||
+  /test-videos\.co\.uk|blob:|^data:|^about:/i.test(u) ||
   /\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ico|json|xml|html)(\?|$)/i.test(u) ||
-  /google-analytics|googlesyndication|doubleclick|facebook\.com\/tr|analytics/i.test(u);
+  AD_DOMAIN_RE.test(u);
+
+// Heuristic: URL looks like a video-embed host page (iframe target), not a direct media file.
+const isEmbedPage = (u) =>
+  /\/(embed|e|v|watch|player|stream|iframe)(\/|[?#])/i.test(u) ||
+  /\/(embed|e|v)-[a-z0-9]+/i.test(u);
 
 const isVideoContentType = (ct) =>
   ct.includes('mpegurl') ||
@@ -309,10 +349,15 @@ const DOM_EXTRACT_SCRIPT = `(function() {
       if (v && !v.startsWith('blob:') && !v.includes('test-videos')) results.push(v);
     });
   });
-  // Iframes
+  // Iframes — capture any with an external http(s) src (filter junk later in host)
   document.querySelectorAll('iframe').forEach(el => {
-    const s = el.getAttribute('src') || el.getAttribute('data-src');
-    if (s && /embed|player|video|stream/i.test(s)) results.push('IFRAME:' + s);
+    const s = el.getAttribute('src') || el.getAttribute('data-src') || el.src;
+    if (!s) return;
+    if (s.startsWith('about:') || s.startsWith('blob:') || s.startsWith('data:') || s.startsWith('javascript:')) return;
+    // Accept protocol-relative, absolute http(s), and root-relative paths
+    if (/^https?:\\/\\//i.test(s) || s.startsWith('//') || s.startsWith('/')) {
+      results.push('IFRAME:' + s);
+    }
   });
   return JSON.stringify(results);
 })()`;

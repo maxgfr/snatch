@@ -148,10 +148,7 @@ function findChrome() {
     '/snap/bin/brave',
   ];
   for (const p of paths) {
-    try {
-      execSync(`test -f "${p}"`, { stdio: 'ignore' });
-      return p;
-    } catch {}
+    if (existsSync(p)) return p;
   }
   for (const cmd of [
     'google-chrome',
@@ -196,34 +193,58 @@ function launchChrome() {
     'about:blank',
   ];
 
+  // Ignore stdout (nothing useful, avoids buffer stalls). Keep stderr piped —
+  // we need it to discover the DevTools WS URL.
   const proc = spawn(chromePath, args, {
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: ['ignore', 'ignore', 'pipe'],
     detached: false,
   });
 
+  // On any early rejection, kill the child so we don't orphan the browser.
+  const killChild = () => {
+    try { proc.kill('SIGKILL'); } catch {}
+  };
+
   return new Promise((resolve, reject) => {
-    let stderr = '';
+    let stderrBuf = '';
+    let resolved = false;
+
     const timer = setTimeout(() => {
+      if (resolved) return;
+      resolved = true;
+      killChild();
       reject(new Error('Chrome launch timeout'));
     }, 15000);
 
-    proc.stderr.on('data', (chunk) => {
-      stderr += chunk.toString();
-      const match = stderr.match(/DevTools listening on (ws:\/\/[^\s]+)/);
+    const onData = (chunk) => {
+      if (resolved) return;
+      stderrBuf += chunk.toString();
+      const match = stderrBuf.match(/DevTools listening on (ws:\/\/[^\s]+)/);
       if (match) {
+        resolved = true;
         clearTimeout(timer);
+        // Stop collecting stderr to avoid unbounded growth.
+        proc.stderr.removeListener('data', onData);
+        proc.stderr.resume(); // let further chunks drain without buffering
+        stderrBuf = '';
         resolve({ proc, wsUrl: match[1] });
       }
-    });
+    };
+    proc.stderr.on('data', onData);
 
     proc.on('error', (e) => {
+      if (resolved) return;
+      resolved = true;
       clearTimeout(timer);
+      killChild();
       reject(e);
     });
 
     proc.on('exit', (code) => {
+      if (resolved) return;
+      resolved = true;
       clearTimeout(timer);
-      if (code) reject(new Error(`Chrome exited with code ${code}`));
+      reject(new Error(`Chrome exited before DevTools ready (code ${code})`));
     });
   });
 }
@@ -236,12 +257,24 @@ const isVideoUrl = (u) =>
   /manifest\.mpd|video.*\.mp4/i.test(u) ||
   /\/hls\/|\/dash\//i.test(u);
 
-const AD_DOMAIN_RE = /(^|\/\/|\.)(vidwestxyz|adexchangeclear|adexchange|adnetwork|popads|popcash|propellerads|runoperagx|clickdir|clickadilla|hotelkobalts|protrafficinspector|ezexfzek|nn125|addthis|disqus|adskeeper|mgid|outbrain|taboola|googletagmanager|googlesyndication|googleadservices|doubleclick|adservice\.google|google-analytics|scorecardresearch|quantserve|hotjar|mixpanel|segment\.(io|com)|facebook\.com\/tr|bing\.com\/bat|yandex\.ru\/metrika)/i;
+// Generic ad/tracker filtering — no hardcoded vendor list to rot over time.
+// Signals used: ad-ish URL path segments, ad-ish hostnames, and analytics pixels.
+
+// Ad path segments — works across any CDN. Matches whole segment (bounded by /).
+const AD_PATH_RE = /\/(ads?|adv|advert|advertising|advertisement|video[_-]?ads?|vast(ads?)?|preroll|midroll|postroll|sponsor(ed)?|promo|banner|affiliate|popunder|popup|interstitial|tracking|tracker|pixel|beacon|telemetry|impression|conversion|adserver|adcontent)(\/|$)/i;
+
+// Ad-ish hostnames — subdomain literally is "ads", "adserver", etc., OR obvious ad-tech vendors
+const AD_HOST_RE = /(^|\.)(ads?|adx|adserver|adservers?|adnetwork|adsystem|adtech|adroll|adnxs|adform|rubicon|pubmatic|openx|criteo|smartadserver|outbrain|taboola|mgid|adskeeper)\.[a-z0-9.-]+\.[a-z]{2,}/i;
+
+// Analytics/privacy pixels — never content
+const TRACKER_HOST_RE = /(^|\.)(googletagmanager|googlesyndication|googleadservices|doubleclick|adservice\.google|google-analytics|scorecardresearch|quantserve|hotjar|mixpanel|amplitude|segment\.io|segment\.com|yandex\.ru)(\/|$)|facebook\.com\/tr|bing\.com\/bat/i;
 
 const isJunk = (u) =>
-  /test-videos\.co\.uk|blob:|^data:|^about:/i.test(u) ||
+  /test-videos\.co\.uk|blob:|^data:|^about:|^javascript:/i.test(u) ||
   /\.(js|css|png|jpg|jpeg|gif|svg|woff|woff2|ico|json|xml|html)(\?|$)/i.test(u) ||
-  AD_DOMAIN_RE.test(u);
+  AD_PATH_RE.test(u) ||
+  AD_HOST_RE.test(u) ||
+  TRACKER_HOST_RE.test(u);
 
 // Heuristic: URL looks like a video-embed host page (iframe target), not a direct media file.
 const isEmbedPage = (u) =>
@@ -425,7 +458,8 @@ function parseCookiesFile(filePath) {
   try {
     const content = readFileSync(filePath, 'utf8');
     const cookies = [];
-    for (const line of content.split('\n')) {
+    for (const rawLine of content.split('\n')) {
+      const line = rawLine.replace(/\r$/, '');
       if (line.startsWith('#') || !line.trim()) continue;
       const parts = line.split('\t');
       if (parts.length >= 7) {
@@ -458,9 +492,12 @@ async function extract() {
   const { proc, wsUrl } = await launchChrome();
   chromeProc = proc;
 
-  // Get browser WebSocket endpoint
+  // Get browser WebSocket endpoint (bounded; Chrome may have launched but
+  // hung its DevTools HTTP server)
   const port = new URL(wsUrl).port;
-  const res = await fetch(`http://127.0.0.1:${port}/json/version`);
+  const res = await fetch(`http://127.0.0.1:${port}/json/version`, {
+    signal: AbortSignal.timeout(5000),
+  });
   const { webSocketDebuggerUrl } = await res.json();
 
   // Connect to browser
@@ -477,20 +514,29 @@ async function extract() {
   await send('Page.enable');
   await send('Runtime.enable');
 
-  // Block ad/tracking domains that cause redirects in headless mode
+  // Network-layer blocklist — CDP only supports `*` wildcards so we use
+  // generic ad/analytics patterns. Keeps ad scripts from triggering popup
+  // redirects during headless extraction. Extraction-time filtering handles
+  // whatever slips through.
   await send('Network.setBlockedURLs', {
     urls: [
-      '*protrafficinspector*',
-      '*hotelkobalts*',
-      '*clickdir*',
-      '*runoperagx*',
+      '*/ads/*',
+      '*/adserver/*',
+      '*/video_ads/*',
+      '*/popunder*',
+      '*/popup*',
+      '*/tracking/*',
+      '*/telemetry/*',
+      '*/beacon/*',
+      '*googletagmanager*',
       '*googlesyndication*',
-      '*doubleclick*',
-      '*ezexfzek*',
-      '*addthis*',
+      '*googleadservices*',
       '*google-analytics*',
+      '*doubleclick*',
       '*facebook.com/tr*',
-      '*nn125.com*',
+      '*bing.com/bat*',
+      '*hotjar*',
+      '*mixpanel*',
     ],
   });
 
@@ -528,6 +574,20 @@ async function extract() {
   // Track video-looking URLs that turned out to be HTML (player/preview pages)
   const htmlPlayerPages = new Set();
 
+  // Track initiator (loader) for every URL — lets us distinguish real player
+  // requests (loaded by page-origin scripts) from ad requests (loaded by
+  // third-party iframes/scripts).
+  const urlInitiators = new Map(); // url → string[] of initiator URLs
+
+  const recordInitiator = (u, init) => {
+    if (!u || urlInitiators.has(u)) return;
+    const stack = [];
+    if (init?.url) stack.push(init.url);
+    const frames = init?.stack?.callFrames || [];
+    for (const f of frames) if (f.url) stack.push(f.url);
+    urlInitiators.set(u, stack);
+  };
+
   // Collect video URLs from network
   browser.on('Network.responseReceived', (params) => {
     const u = params.response?.url || '';
@@ -541,8 +601,10 @@ async function extract() {
         videoUrls.delete(u);
         debug('Removed fake video URL (HTML):', u);
       }
-      // Track as potential player page to follow later
-      if (isVideoUrl(u)) htmlPlayerPages.add(u);
+      // Track as potential player page to follow later. Either the URL shape
+      // looks video-ish, or the path looks like a video-embed host
+      // (/embed/..., /e/..., /player/...).
+      if (isVideoUrl(u) || isEmbedPage(u)) htmlPlayerPages.add(u);
       return;
     }
     if (isVideoUrl(u) || isVideoContentType(ct)) {
@@ -553,11 +615,13 @@ async function extract() {
 
   browser.on('Network.requestWillBeSent', (params) => {
     const u = params.request?.url || '';
+    recordInitiator(u, params.initiator);
     if (!isJunk(u) && isVideoUrl(u)) {
       debug('Network request:', u);
       videoUrls.add(u);
     }
   });
+
 
   // Track page load
   let pageLoaded = false;
@@ -638,9 +702,28 @@ async function extract() {
     console.error('DOM_EXTRACT_ERROR:' + e.message);
   }
 
-  // Try clicking server/source selection buttons that trigger video loading
-  // Many streaming sites load video only after user clicks a server button
-  if (videoUrls.size === 0 || [...videoUrls].every((u) => u.startsWith('IFRAME:'))) {
+  // A URL is "high-confidence real" if it has cryptographic signing or classic
+  // streaming-manifest shape. Unsigned random mp4s from unknown CDNs don't count
+  // — those are usually ad decoys firing while the real player is still idle.
+  const isHighConfidence = (u) =>
+    !u.startsWith('IFRAME:') &&
+    (/[?&](token|signature|hmac|expires|exp|acl|sig|sign|policy|hdnts|hdntl)=/i.test(u) ||
+      /~hmac=|~st=|~exp=/i.test(u) ||
+      /\.m3u8(\?|$|&)/i.test(u) ||
+      /\.mpd(\?|$|&)/i.test(u) ||
+      /\/(slice|chunklist|manifest|playlist|hls2?|dash)\//i.test(u));
+
+  const hasHighConfidence = () => [...videoUrls].some(isHighConfidence);
+
+  // Try clicking server/source selection buttons that trigger video loading.
+  // Streaming sites often require a server click before the real player URL is
+  // issued. We also click if what we have so far looks like ad decoys (no
+  // signed tokens, no m3u8/mpd, no streaming path).
+  if (
+    videoUrls.size === 0 ||
+    [...videoUrls].every((u) => u.startsWith('IFRAME:')) ||
+    !hasHighConfidence()
+  ) {
     debug('Trying to click server/source buttons...');
     try {
       const serverClickResult = await browser.evaluate(
@@ -681,16 +764,11 @@ async function extract() {
         // Wait for AJAX + player initialization
         await new Promise((r) => setTimeout(r, 5000));
 
-        // Check if a captcha appeared (common on streaming sites)
-        try {
-          const hasCaptcha = await browser.evaluate(
-            sessionId,
-            `!!(document.querySelector('#player-captcha, [id*="captcha"], .g-recaptcha, .h-captcha, [class*="captcha"]'))`
-          );
-          if (hasCaptcha) {
-            console.error('CAPTCHA_REQUIRED: site requires captcha, use -c/--cookies with exported browser cookies');
-          }
-        } catch {}
+        // Defer captcha diagnostic until the end — only report it if we
+        // haven't found any URLs, and only if the captcha is actually
+        // visible and interactive (input/iframe present). Raw presence of
+        // an element with "captcha" in its class/id gives false positives
+        // (e.g. empty `#player-captcha` containers that hold the player).
 
         // Re-extract from DOM (iframes, video elements, player APIs)
         try {
@@ -751,26 +829,9 @@ async function extract() {
       await sendPlayer('Page.enable');
       await sendPlayer('Runtime.enable');
 
-      // Collect video URLs from the player page network
-      browser.on('Network.responseReceived', (params) => {
-        if (params.sessionId !== undefined && params.sessionId !== playerSessionId) return;
-        const u = params.response?.url || '';
-        const ct = params.response?.headers?.['content-type'] || params.response?.mimeType || '';
-        if (isJunk(u) || /text\/html/i.test(ct)) return;
-        if (isVideoUrl(u) || isVideoContentType(ct)) {
-          debug('Player page network response:', u);
-          videoUrls.add(u);
-        }
-      });
-
-      browser.on('Network.requestWillBeSent', (params) => {
-        if (params.sessionId !== undefined && params.sessionId !== playerSessionId) return;
-        const u = params.request?.url || '';
-        if (!isJunk(u) && isVideoUrl(u)) {
-          debug('Player page network request:', u);
-          videoUrls.add(u);
-        }
-      });
+      // The main-session network handlers already match by method, not by
+      // session, so they capture events from this new player session too.
+      // No extra listeners needed.
 
       await sendPlayer('Page.navigate', { url: playerUrl });
 
@@ -802,28 +863,103 @@ async function extract() {
     }
   }
 
+  // If we still have nothing, probe for a visible interactive captcha so the
+  // shell wrapper can give the user a helpful message. Only emit the signal
+  // when no URLs were extracted and the captcha is actually interactive
+  // (visible element with an input, iframe, or image) — checking for "captcha"
+  // in a class/id is otherwise a common false positive.
+  if (videoUrls.size === 0) {
+    try {
+      const hasInteractiveCaptcha = await browser.evaluate(
+        sessionId,
+        `(function(){
+          const els = document.querySelectorAll('#player-captcha,[id*="captcha" i],.g-recaptcha,.h-captcha,[class*="captcha" i]');
+          for (const el of els) {
+            if (el.offsetParent === null) continue;
+            if (el.querySelector('input,iframe,textarea,img[src*="captcha" i]')) return true;
+          }
+          return false;
+        })()`
+      );
+      if (hasInteractiveCaptcha) {
+        console.error('CAPTCHA_REQUIRED: site requires captcha, export cookies from a browser session where captcha was solved and pass with -c');
+      }
+    } catch {}
+  }
+
   // Clean up
   try {
     await browser.send('Target.closeTarget', { targetId });
   } catch {}
   browser.disconnect();
 
-  // Output results (sorted by priority: m3u8 > mpd > mp4 > others)
+  // Output results — score everything together, emit the winner first.
   const results = [...videoUrls].filter(Boolean);
   const iframes = results.filter((u) => u.startsWith('IFRAME:'));
   const videos = results.filter((u) => !u.startsWith('IFRAME:'));
 
-  if (videos.length > 0) {
-    const sorted = videos.sort((a, b) => {
-      const score = (u) => (/m3u8/i.test(u) ? 3 : /\.mpd/i.test(u) ? 2 : /\.mp4/i.test(u) ? 1 : 0);
-      return score(b) - score(a);
-    });
-    sorted.forEach((u) => console.log(u));
-  } else if (iframes.length > 0) {
-    iframes.forEach((u) => console.log(u));
-  } else {
-    process.exit(1);
+  if (results.length === 0) throw new Error('NO_VIDEO_URL_FOUND');
+
+  // Page-origin registrable domain (eTLD+1 approximation, good enough for scoring).
+  const pageHost = (() => {
+    try { return new URL(url).hostname; } catch { return ''; }
+  })();
+  const etld1 = (h) => {
+    const parts = (h || '').split('.');
+    return parts.slice(-2).join('.');
+  };
+  const pageDomain = etld1(pageHost);
+
+  // Score by format + auth-token presence + streaming-path signals + initiator.
+  // Signed/tokenized stream URLs from page-origin-initiated requests are almost
+  // always the real video; unsigned .mp4 loaded by third-party scripts = ad decoy.
+  const scoreVideo = (u) => {
+    let s = 0;
+    if (/\.m3u8(\?|$|&)|mpegurl/i.test(u)) s += 100;
+    else if (/\.mpd(\?|$|&)|dash/i.test(u)) s += 80;
+    else if (/\.mp4(\?|$|&)/i.test(u)) s += 40;
+    else s += 10;
+    if (/[?&](token|signature|hmac|expires|exp|acl|sig|sign|policy|key|hdnts|hdntl)=/i.test(u)) s += 60;
+    if (/~hmac=|~st=|~exp=|~acl=/i.test(u)) s += 30;
+    if (/\/(slice|hls|dash|stream|manifest|playlist|chunklist|media|video|hls2|vod|live)\//i.test(u)) s += 30;
+    const inits = urlInitiators.get(u) || [];
+    if (inits.length > 0 && pageDomain) {
+      const initDomains = inits
+        .map((iu) => { try { return etld1(new URL(iu).hostname); } catch { return ''; } })
+        .filter(Boolean);
+      if (initDomains.some((d) => d === pageDomain)) s += 40;
+      else if (initDomains.length > 0 && initDomains.every((d) => d !== pageDomain)) s -= 25;
+    }
+    if (/\/\d{6,}\.mp4(\?|$)/.test(u) && !/[?&]/.test(u.split('.mp4')[1] || '')) s -= 40;
+    return s;
+  };
+
+  // Iframes get a baseline score that beats low-confidence ad-like videos
+  // (~40) but loses to high-confidence real video URLs (>=100). An embed-host
+  // iframe is a reliable path to the real video via recursive extraction.
+  const scoreIframe = (u) => {
+    let s = 70;
+    const raw = u.slice('IFRAME:'.length);
+    // Same-origin iframes are usually structural (menus, consent), not players.
+    try {
+      const h = new URL(raw, `https://${pageHost}`).hostname;
+      if (etld1(h) === pageDomain) s -= 30;
+    } catch {}
+    // Known social/comment/share widgets — never video
+    if (/(^|\.)(disqus|facebook|fb|twitter|x|platform\.twitter|widgets|linkedin|reddit|pinterest|vk)\.[a-z.]{2,}/i.test(raw)) s -= 80;
+    // Path hints for non-video embeds
+    if (/\/(comments?|discuss|share|follow|like|tweet|reactions?|social)(\/|[?#]|$)/i.test(raw)) s -= 60;
+    // Path hints for video embeds
+    if (/\/(embed|e|v|watch|player|stream|iframe)(\/|[?#])|\/(embed|e|v)-[a-z0-9]+/i.test(raw)) s += 20;
+    return s;
+  };
+
+  const score = (u) => (u.startsWith('IFRAME:') ? scoreIframe(u) : scoreVideo(u));
+  const sorted = results.sort((a, b) => score(b) - score(a));
+  if (VERBOSE) {
+    for (const u of sorted) debug(`score=${score(u)}`, u.slice(0, 130));
   }
+  sorted.forEach((u) => console.log(u));
 }
 
 // --- Cleanup Chrome profile -----------------------------------------------
@@ -836,16 +972,30 @@ function cleanupProfile() {
 
 // --- Run ------------------------------------------------------------------
 
+const terminate = (code = 0) => {
+  if (chromeProc) {
+    try { chromeProc.kill('SIGKILL'); } catch {}
+  }
+  cleanupProfile();
+  process.exit(code);
+};
+
+// Handle Ctrl-C / SIGTERM so Chrome is never orphaned.
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+  process.on(sig, () => terminate(130));
+}
+
 try {
   await extract();
 } catch (e) {
   console.error('EXTRACT_ERROR:' + e.message);
-  process.exit(1);
+  terminate(1);
 } finally {
   if (chromeProc) {
-    try {
-      chromeProc.kill('SIGTERM');
-    } catch {}
+    try { chromeProc.kill('SIGKILL'); } catch {}
+    // Give the OS a tick to release Brave's file handles before rm'ing the
+    // profile. Without this, Brave's write-on-exit can leave ghost files.
+    await new Promise((r) => setTimeout(r, 150));
   }
   cleanupProfile();
 }

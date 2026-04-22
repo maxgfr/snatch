@@ -16,6 +16,9 @@ if (!url) {
 const TIMEOUT = parseInt(process.env.EXTRACT_TIMEOUT || '30000', 10);
 const VERBOSE = process.env.SNATCH_VERBOSE === '1';
 const COOKIES_FILE = process.env.SNATCH_COOKIES || '';
+// Referer passed in from the parent page during iframe recursion — some
+// embed hosts (cloudnestra, streamtape, …) 403 without a matching Referer.
+const REFERER = process.env.SNATCH_REFERER || '';
 
 const CHROME_PROFILE = mkdtempSync(join(tmpdir(), 'snatch-chrome-'));
 
@@ -118,17 +121,16 @@ function findChrome() {
   if (process.env.SNATCH_CHROME && existsSync(process.env.SNATCH_CHROME)) {
     return process.env.SNATCH_CHROME;
   }
+  // Browser priority: prefer browsers without built-in content blockers that
+  // flag streaming-embed hosts. Brave's Shields can't be disabled via CLI,
+  // so Brave is LAST — only picked if nothing cleaner is installed.
   const paths = [
-    // macOS - Chrome family
+    // macOS — pure Chromium / Chrome / Edge / Arc / Vivaldi / Opera / Thorium
     '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
     '/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary',
     '/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta',
     '/Applications/Google Chrome Dev.app/Contents/MacOS/Google Chrome Dev',
     '/Applications/Chromium.app/Contents/MacOS/Chromium',
-    // macOS - other Chromium-based browsers (CDP-compatible)
-    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
-    '/Applications/Brave Browser Beta.app/Contents/MacOS/Brave Browser Beta',
-    '/Applications/Brave Browser Nightly.app/Contents/MacOS/Brave Browser Nightly',
     '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
     '/Applications/Microsoft Edge Beta.app/Contents/MacOS/Microsoft Edge Beta',
     '/Applications/Microsoft Edge Dev.app/Contents/MacOS/Microsoft Edge Dev',
@@ -136,15 +138,19 @@ function findChrome() {
     '/Applications/Vivaldi.app/Contents/MacOS/Vivaldi',
     '/Applications/Opera.app/Contents/MacOS/Opera',
     '/Applications/Thorium.app/Contents/MacOS/Thorium',
+    // macOS — Brave last (built-in Shields blocks many streaming-embed hosts)
+    '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser',
+    '/Applications/Brave Browser Beta.app/Contents/MacOS/Brave Browser Beta',
+    '/Applications/Brave Browser Nightly.app/Contents/MacOS/Brave Browser Nightly',
     // Linux
     '/usr/bin/google-chrome',
     '/usr/bin/google-chrome-stable',
     '/usr/bin/chromium',
     '/usr/bin/chromium-browser',
-    '/usr/bin/brave-browser',
     '/usr/bin/microsoft-edge',
     '/usr/bin/vivaldi',
     '/snap/bin/chromium',
+    '/usr/bin/brave-browser',
     '/snap/bin/brave',
   ];
   for (const p of paths) {
@@ -155,10 +161,10 @@ function findChrome() {
     'google-chrome-stable',
     'chromium',
     'chromium-browser',
-    'brave-browser',
-    'brave',
     'microsoft-edge',
     'vivaldi',
+    'brave-browser',
+    'brave',
   ]) {
     try {
       const found = execSync(`which ${cmd}`, { stdio: 'pipe' }).toString().trim();
@@ -166,8 +172,9 @@ function findChrome() {
     } catch {}
   }
   throw new Error(
-    'No Chromium-based browser found. Install Chrome, Chromium, Brave, Edge, Arc, or Vivaldi, ' +
-    'or set SNATCH_CHROME=/path/to/browser'
+    'No Chromium-based browser found. Install one of: Chrome, Chromium, Edge, Arc, Vivaldi, Brave. ' +
+    'Note: Brave Shields blocks many streaming-embed hosts; prefer Chromium for streaming extraction. ' +
+    'Override with SNATCH_CHROME=/path/to/browser'
   );
 }
 
@@ -176,6 +183,7 @@ function findChrome() {
 function launchChrome() {
   const chromePath = findChrome();
   debug('Chrome path:', chromePath);
+
   const args = [
     '--headless=new',
     '--disable-gpu',
@@ -545,6 +553,11 @@ async function extract() {
     userAgent:
       'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
   });
+
+  // Referer handling moved into the Page.navigate call below — setting a
+  // global extra header would leak the parent-page Referer onto every
+  // sub-resource request, which trips anti-hotlink logic on some embed
+  // hosts (e.g. vidcdn.co returns an interstitial).
   await send('Page.addScriptToEvaluateOnNewDocument', {
     source: `
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -639,9 +652,15 @@ async function extract() {
   });
 
   // Navigate to URL
-  debug('Navigating to:', url);
+  debug('Navigating to:', url, REFERER ? `(referrer: ${REFERER})` : '');
   try {
-    await send('Page.navigate', { url });
+    // Pass referrer ONLY on the top-level navigation. Chrome/Chromium will
+    // then let the document manage Referer for its own sub-resources
+    // (which become same-origin vidcdn.co → vidcdn.co, as a real browser
+    // would do when the iframe was loaded from its parent page).
+    const navParams = { url };
+    if (REFERER) navParams.referrer = REFERER;
+    await send('Page.navigate', navParams);
   } catch (e) {
     console.error('NAVIGATE_ERROR:' + e.message);
   }
@@ -651,6 +670,24 @@ async function extract() {
 
   // Grace period for dynamic content after load
   await new Promise((r) => setTimeout(r, 2000));
+
+  // Detect Brave Shields hard-block (ERR_BLOCKED_BY_CLIENT) — its built-in
+  // adblock flags many streaming-embed hosts and CLI flags can't disable it.
+  // Surface a clear error so the user installs a non-Brave Chromium.
+  try {
+    const blocked = await browser.evaluate(
+      sessionId,
+      `(document.getElementById('main-frame-error') && /ERR_BLOCKED_BY_CLIENT|bloqu[eé]|blocked/i.test(document.body.innerText || '')) ? document.title + '||' + (document.body.innerText||'').slice(0,200) : ''`
+    );
+    if (blocked) {
+      console.error(
+        'BRAVE_SHIELDS_BLOCK: Brave Shields is blocking this embed host. Install Chromium and retry: brew install --cask chromium'
+      );
+      throw new Error('Brave Shields blocked embed host — install Chromium');
+    }
+  } catch (e) {
+    if (e.message?.includes('Brave Shields')) throw e;
+  }
 
   // Extract from DOM and player APIs BEFORE clicking (in case click navigates away)
   try {
@@ -715,6 +752,25 @@ async function extract() {
 
   const hasHighConfidence = () => [...videoUrls].some(isHighConfidence);
 
+  // Parent-page eTLD+1 — used to decide whether an iframe is "external"
+  // (i.e. likely an embed host to follow) or just same-site structure.
+  const pageHostForMatch = (() => { try { return new URL(url).hostname; } catch { return ''; } })();
+  const pageDomainForMatch = (pageHostForMatch || '').split('.').slice(-2).join('.');
+  // Known non-video iframe hosts (social/comment widgets). Presence of these
+  // does NOT mean the real embed has loaded.
+  const SOCIAL_IFRAME_RE = /(^|\.)(disqus|facebook|fb|twitter|x|platform\.twitter|widgets|linkedin|reddit|pinterest|vk|youtube\.com|youtu\.be|vimeo\.com|dailymotion\.com)\.[a-z.]{2,}/i;
+  const hasExternalIframe = () =>
+    [...videoUrls].some((u) => {
+      if (!u.startsWith('IFRAME:')) return false;
+      const raw = u.slice('IFRAME:'.length);
+      if (SOCIAL_IFRAME_RE.test(raw)) return false;
+      try {
+        const h = new URL(raw, `https://${pageHostForMatch}`).hostname;
+        const d = h.split('.').slice(-2).join('.');
+        return !!d && d !== pageDomainForMatch;
+      } catch { return false; }
+    });
+
   // Try clicking server/source selection buttons that trigger video loading.
   // Streaming sites often require a server click before the real player URL is
   // issued. We also click if what we have so far looks like ad decoys (no
@@ -724,66 +780,112 @@ async function extract() {
     [...videoUrls].every((u) => u.startsWith('IFRAME:')) ||
     !hasHighConfidence()
   ) {
-    debug('Trying to click server/source buttons...');
+    debug('Enumerating server candidates...');
     try {
-      const serverClickResult = await browser.evaluate(
+      // Enumerate all plausible server switches on the page. Each candidate
+      // is either a global-function call (`type: 'fn'`) or a DOM element
+      // click (`type: 'sel'` — we tag the element so we can re-find it).
+      const enumResult = await browser.evaluate(
         sessionId,
         `(function() {
-          const clicked = [];
-          // Try calling startPlayer() if it exists (common pattern)
-          if (typeof startPlayer === 'function') {
-            try { startPlayer(); clicked.push('startPlayer()'); } catch(e) {}
-          }
-          // Click elements with onclick handlers related to streaming/servers
-          if (clicked.length === 0) {
-            const allClickable = document.querySelectorAll('[onclick]');
-            for (const el of allClickable) {
-              const handler = el.getAttribute('onclick') || '';
-              if (/getStream|getLink|loadServer|selectServer|playVideo|loadVideo/i.test(handler)) {
-                try { el.click(); clicked.push('onclick:' + handler.substring(0, 60)); break; } catch(e) {}
+          const cands = [];
+          const seen = new Set();
+
+          // Well-known player-loader functions
+          const loaderFns = [
+            'startPlayer','playVideo','loadVideo','selectServer','switchServer',
+            'load_film_iframe','load_movie_iframe','load_episode_iframe',
+            'loadIframe','loadStream','loadSource','loadServer',
+          ];
+          for (const fn of loaderFns) {
+            if (typeof window[fn] !== 'function') continue;
+            // Sniff every onclick calling this fn to enumerate args
+            const anchors = document.querySelectorAll('[onclick*="' + fn + '("]');
+            for (const a of anchors) {
+              const m = (a.getAttribute('onclick') || '').match(
+                new RegExp(fn + '\\\\((?:["\\'])([^"\\']+)(?:["\\'])')
+              );
+              const label = (a.textContent || '').trim().slice(0, 30);
+              const cls = (a.className || '').toString().toLowerCase();
+              if (/trailer|preview|teaser/i.test(label + ' ' + cls)) continue;
+              if (m) {
+                const key = fn + ':' + m[1];
+                if (!seen.has(key)) { seen.add(key); cands.push({type:'fn', fn, arg: m[1], label}); }
               }
             }
-          }
-          // Click server list items (common pattern: list items in a server container)
-          if (clicked.length === 0) {
-            const serverItems = document.querySelectorAll(
-              '[data-server], [data-value*="server"], [class*="server"] li, [data-box*="serv"] ~ * li'
-            );
-            for (const el of serverItems) {
-              if (el.offsetParent !== null) {
-                try { el.click(); clicked.push('server-item:' + el.textContent.trim().substring(0, 30)); break; } catch(e) {}
-              }
+            // Fallback: bare fn call if no sniffable anchor
+            if (![...seen].some((k) => k.startsWith(fn + ':')) && anchors.length === 0) {
+              cands.push({type:'fn', fn, arg: null, label: fn + '()'});
             }
           }
-          return JSON.stringify(clicked);
+
+          // Structural server anchors
+          const structuralSel =
+            '[data-server],[data-value*="server"],[class*="server"] li,' +
+            '[data-box*="serv"] ~ * li,.player_nav a[href^="#tab"],' +
+            '.idTabs a,[id^="Nav_"][href^="#"],[class*="server-item"],' +
+            '[class*="serverItem"],[class*="srv"],[data-id*="server"]';
+          let idx = 0;
+          for (const el of document.querySelectorAll(structuralSel)) {
+            if (el.offsetParent === null) continue;
+            const label = (el.textContent || '').trim().toLowerCase();
+            const cls = (el.className || '').toString().toLowerCase();
+            if (/trailer|preview|teaser/.test(label + ' ' + cls)) continue;
+            el.setAttribute('data-snatch-idx', String(idx));
+            cands.push({type:'sel', sel: '[data-snatch-idx="' + idx + '"]', label: label.slice(0,30)});
+            idx++;
+          }
+          return JSON.stringify(cands);
         })()`
       );
-      const serverClicked = JSON.parse(serverClickResult || '[]');
-      if (serverClicked.length > 0) {
-        debug('Server buttons clicked:', serverClicked);
-        // Wait for AJAX + player initialization
-        await new Promise((r) => setTimeout(r, 5000));
+      const candidates = JSON.parse(enumResult || '[]');
+      debug('Server candidates:', candidates.length);
 
-        // Defer captcha diagnostic until the end — only report it if we
-        // haven't found any URLs, and only if the captcha is actually
-        // visible and interactive (input/iframe present). Raw presence of
-        // an element with "captcha" in its class/id gives false positives
-        // (e.g. empty `#player-captcha` containers that hold the player).
-
-        // Re-extract from DOM (iframes, video elements, player APIs)
+      // Click candidates one at a time with a long polling window so the
+      // first-clicked embed has time to emit its signed m3u8/mpd request.
+      // Stop as soon as we have a high-confidence URL, so subsequent clicks
+      // don't stomp the iframe src mid-load.
+      const MAX_SERVERS = Math.min(candidates.length, 5);
+      for (let i = 0; i < MAX_SERVERS; i++) {
+        if (hasHighConfidence()) break;
+        const c = candidates[i];
+        const clickExpr =
+          c.type === 'fn'
+            ? `try { window[${JSON.stringify(c.fn)}](${c.arg !== null ? JSON.stringify(c.arg) : ''}); 'ok' } catch(e) { 'err:' + e.message }`
+            : `(function(){ const el = document.querySelector(${JSON.stringify(c.sel)}); if (!el) return 'missing'; try { el.click(); return 'ok'; } catch(e) { return 'err:'+e.message; } })()`;
+        try {
+          const outcome = await browser.evaluate(sessionId, clickExpr);
+          debug(`Tried server "${c.label}" (${c.type}) →`, outcome);
+        } catch (e) {
+          debug('Server click threw:', e.message);
+          continue;
+        }
+        // Wait for the server to load its iframe / fire its requests —
+        // polling for a high-confidence URL. Streaming sites typically need
+        // 3-10 s for the embed to initialize and emit m3u8/mpd requests;
+        // we poll every 500 ms and break as soon as a signed streaming URL
+        // shows up, so we don't stomp on it with the next server click.
+        // Inner wait: only break on a high-confidence real URL. We keep
+        // waiting even if an iframe appears, because streaming embeds load
+        // in two phases (iframe DOM swap → player init → signed m3u8) and
+        // we want to catch the m3u8 in the top-level Network listener
+        // before moving on.
+        for (let w = 0; w < 16; w++) {
+          await new Promise((r) => setTimeout(r, 500));
+          if (hasHighConfidence()) break;
+        }
         try {
           const domResult = await browser.evaluate(sessionId, DOM_EXTRACT_SCRIPT);
           const extracted = JSON.parse(domResult || '[]');
-          debug('Post-server-click DOM extracted:', extracted.length, 'URLs');
           for (const u of extracted) {
             if (u && !isJunk(u)) videoUrls.add(u);
           }
         } catch (e) {
-          debug('Post-server-click DOM extraction error:', e.message);
+          debug('Post-click DOM extract error:', e.message);
         }
       }
     } catch (e) {
-      debug('Server click error:', e.message);
+      debug('Server enumeration error:', e.message);
     }
   }
 
@@ -833,7 +935,8 @@ async function extract() {
       // session, so they capture events from this new player session too.
       // No extra listeners needed.
 
-      await sendPlayer('Page.navigate', { url: playerUrl });
+      // Forward parent-page URL as referrer on the navigation only.
+      await sendPlayer('Page.navigate', { url: playerUrl, referrer: url });
 
       // Wait for player page to load
       await new Promise((resolve) => {
@@ -841,18 +944,23 @@ async function extract() {
         browser.on('Page.loadEventFired', onLoad);
         setTimeout(resolve, TIMEOUT);
       });
-      await new Promise((r) => setTimeout(r, 2000));
 
-      // Extract from player page DOM (inline scripts, THEOplayer, etc.)
-      try {
-        const domResult = await browser.evaluate(playerSessionId, DOM_EXTRACT_SCRIPT);
-        const extracted = JSON.parse(domResult || '[]');
-        debug('Player page DOM extracted:', extracted.length, 'URLs');
-        for (const u of extracted) {
-          if (u && !isJunk(u)) videoUrls.add(u);
-        }
-      } catch (e) {
-        debug('Player page DOM extraction error:', e.message);
+      // Long polling window: the player page loads a chain of iframes
+      // (embed gateway → final player) that emit the real m3u8 only after
+      // their JS finishes initialising. CDP flat mode routes OOPIF Network
+      // events to the parent session, so the main handlers will capture
+      // them as they arrive. Poll ~20 s and re-extract DOM periodically.
+      for (let poll = 0; poll < 20; poll++) {
+        await new Promise((r) => setTimeout(r, 1000));
+        if (hasHighConfidence()) break;
+        try {
+          const domResult = await browser.evaluate(playerSessionId, DOM_EXTRACT_SCRIPT);
+          const extracted = JSON.parse(domResult || '[]');
+          for (const u of extracted) {
+            if (u && !isJunk(u)) videoUrls.add(u);
+          }
+          if (hasHighConfidence()) break;
+        } catch {}
       }
 
       try {
@@ -940,13 +1048,19 @@ async function extract() {
   const scoreIframe = (u) => {
     let s = 70;
     const raw = u.slice('IFRAME:'.length);
-    // Same-origin iframes are usually structural (menus, consent), not players.
+    let host = '';
     try {
-      const h = new URL(raw, `https://${pageHost}`).hostname;
-      if (etld1(h) === pageDomain) s -= 30;
+      host = new URL(raw, `https://${pageHost}`).hostname;
     } catch {}
+    // Same-origin iframes are usually structural (menus, consent), not players.
+    if (host && etld1(host) === pageDomain) s -= 30;
     // Known social/comment/share widgets — never video
     if (/(^|\.)(disqus|facebook|fb|twitter|x|platform\.twitter|widgets|linkedin|reddit|pinterest|vk)\.[a-z.]{2,}/i.test(raw)) s -= 80;
+    // Mainstream video platforms embedded on an unrelated site → almost
+    // always a trailer/preview, not the content the user asked for. Penalize
+    // unless the parent page is on the same platform.
+    const platformRe = /(^|\.)(youtube\.com|youtu\.be|vimeo\.com|dailymotion\.com|twitch\.tv|tiktok\.com|instagram\.com|facebook\.com\/watch)/i;
+    if (platformRe.test(raw) && !platformRe.test(pageHost)) s -= 80;
     // Path hints for non-video embeds
     if (/\/(comments?|discuss|share|follow|like|tweet|reactions?|social)(\/|[?#]|$)/i.test(raw)) s -= 60;
     // Path hints for video embeds

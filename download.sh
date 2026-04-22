@@ -166,6 +166,20 @@ try_ytdlp() {
 
   debug "yt-dlp ${ytdlp_args[*]} $url"
 
+  # Peek at what yt-dlp would download before committing. If yt-dlp's
+  # generic extractor is about to pull a YouTube trailer from a non-YouTube
+  # page (common on streaming aggregators that embed a trailer iframe),
+  # skip yt-dlp and fall through to CDP extraction instead.
+  local peek
+  peek=$(yt-dlp --no-check-certificates --no-warnings -g "$url" 2>/dev/null | head -5) || peek=""
+  if [ -n "$peek" ]; then
+    if ! echo "$url" | grep -qiE '(youtube\.com|youtu\.be)' \
+       && echo "$peek" | grep -qi 'googlevideo\.com\|youtube\.com'; then
+      warn "yt-dlp returned a YouTube URL for a non-YouTube page (likely a trailer) — skipping to CDP extraction"
+      return 1
+    fi
+  fi
+
   if yt-dlp "${ytdlp_args[@]}" "$url"; then
     return 0
   fi
@@ -200,27 +214,40 @@ extract_with_cdp() {
       echo "$errmsg" >&2
     fi
 
-    if echo "$errmsg" | grep -qi "401\|403\|unauthorized\|forbidden"; then
-      err "This site requires authentication"
-      return 1
-    fi
-    if echo "$errmsg" | grep -qi "paywall\|premium\|subscribe"; then
-      err "Premium content, login required"
-      return 1
-    fi
-    if echo "$errmsg" | grep -qi "drm\|widevine\|encrypted"; then
-      err "DRM-protected content cannot be downloaded"
-      return 1
-    fi
-    if echo "$errmsg" | grep -qi "timeout\|timed.out"; then
-      err "Page took too long to load"
-      return 1
-    fi
-    if echo "$errmsg" | grep -qi "CAPTCHA_REQUIRED"; then
-      err "This site requires a captcha"
-      warn "Export cookies from your browser and use: snatch -c cookies.txt '$url'"
-      warn "Tip: use a browser extension like 'Get cookies.txt LOCALLY' to export cookies"
-      return 1
+    # Diagnostic error codes — only trust them when no URLs were extracted.
+    # Site pages routinely include `401`/`403` as substrings in tokens, ASNs,
+    # timestamps, and debug URLs; matching those as auth failures while real
+    # URLs are being returned is a false positive.
+    if [ -z "$result" ]; then
+      if echo "$errmsg" | grep -qi "BRAVE_SHIELDS_BLOCK\|ERR_BLOCKED_BY_CLIENT"; then
+        err "Brave Shields blocked this streaming-embed host"
+        warn "Brave's built-in adblocker can't be disabled via CLI. Install Chromium and retry:"
+        warn "  brew install --cask chromium"
+        warn "Or set SNATCH_CHROME=/path/to/another/chromium-browser"
+        return 1
+      fi
+      if echo "$errmsg" | grep -qi "CAPTCHA_REQUIRED"; then
+        err "This site requires a captcha"
+        warn "Export cookies from your browser and use: snatch -c cookies.txt '$url'"
+        warn "Tip: use a browser extension like 'Get cookies.txt LOCALLY' to export cookies"
+        return 1
+      fi
+      if echo "$errmsg" | grep -qi "unauthorized\|forbidden\|HTTP/[12][^0-9]*40[13]"; then
+        err "This site requires authentication"
+        return 1
+      fi
+      if echo "$errmsg" | grep -qi "paywall\|premium\|subscribe"; then
+        err "Premium content, login required"
+        return 1
+      fi
+      if echo "$errmsg" | grep -qi "widevine\|encrypted.*media"; then
+        err "DRM-protected content cannot be downloaded"
+        return 1
+      fi
+      if echo "$errmsg" | grep -qi "timeout\|timed.out"; then
+        err "Page took too long to load"
+        return 1
+      fi
     fi
   fi
 
@@ -228,33 +255,54 @@ extract_with_cdp() {
     return 1
   fi
 
-  # Handle iframe results (recursive extraction)
+  # Handle iframe results (recursive extraction, up to 3 levels deep).
+  # Embed hosts often chain (site → embed gateway → final player) so allow
+  # several hops before giving up.
+  local current_url="$url"
+  local depth=0
+  local max_depth=3
   local first_line
   first_line=$(echo "$result" | head -1)
 
-  if [[ "$first_line" == IFRAME:* ]]; then
+  while [[ "$first_line" == IFRAME:* && $depth -lt $max_depth ]]; do
     local iframe_url="${first_line#IFRAME:}"
     if [[ "$iframe_url" == //* ]]; then
       iframe_url="https:$iframe_url"
     elif [[ "$iframe_url" == /* ]]; then
       local base
-      base=$(echo "$url" | grep -oE 'https?://[^/]+')
+      base=$(echo "$current_url" | grep -oE 'https?://[^/]+')
       iframe_url="${base}${iframe_url}"
     fi
-    warn "Found embedded iframe, extracting from: $iframe_url"
-    if [ ${#env_args[@]} -gt 0 ]; then
-      result=$(env "${env_args[@]}" node "$EXTRACT_SCRIPT" "$iframe_url" 2>/dev/null) || true
-    else
-      result=$(node "$EXTRACT_SCRIPT" "$iframe_url" 2>/dev/null) || true
+    warn "Following iframe (depth $((depth+1))): $iframe_url"
+    local next_stderr
+    next_stderr=$(mktemp)
+    TMPFILES+=("$next_stderr")
+    # Build a fresh env-arg array that also includes SNATCH_REFERER, so embed
+    # hosts (cloudnestra, vidsrc, streamtape, …) that enforce referer checks
+    # or Cloudflare challenges don't 403 the recursion.
+    local iframe_env=("${env_args[@]}" "SNATCH_REFERER=$current_url")
+    result=$(env "${iframe_env[@]}" node "$EXTRACT_SCRIPT" "$iframe_url" 2>"$next_stderr") || true
+    if $VERBOSE && [ -s "$next_stderr" ]; then
+      debug "CDP stderr (iframe depth $((depth+1))):"
+      cat "$next_stderr" >&2
     fi
     if [ -z "$result" ]; then
+      if grep -qi "BRAVE_SHIELDS_BLOCK\|ERR_BLOCKED_BY_CLIENT" "$next_stderr" 2>/dev/null; then
+        err "Brave Shields blocked the embed host: $iframe_url"
+        warn "Brave's built-in adblocker can't be disabled via CLI. Install Chromium:"
+        warn "  brew install --cask chromium"
+        warn "Or set SNATCH_CHROME=/path/to/another/chromium-browser"
+      fi
       return 1
     fi
+    current_url="$iframe_url"
     first_line=$(echo "$result" | head -1)
-    if [[ "$first_line" == IFRAME:* ]]; then
-      err "Nested iframes too deep"
-      return 1
-    fi
+    depth=$((depth + 1))
+  done
+
+  if [[ "$first_line" == IFRAME:* ]]; then
+    err "Iframe nesting exceeded max depth ($max_depth)"
+    return 1
   fi
 
   echo "$result"
@@ -315,6 +363,16 @@ main() {
 
     local ytdlp_urls=""
     ytdlp_urls=$(yt-dlp --no-check-certificates --no-warnings -g "$url" 2>/dev/null) || true
+
+    # Reject yt-dlp output if it's a YouTube URL and the input page isn't
+    # YouTube — that's the generic extractor pulling a trailer iframe.
+    if [ -n "$ytdlp_urls" ]; then
+      if ! echo "$url" | grep -qiE '(youtube\.com|youtu\.be)' \
+         && echo "$ytdlp_urls" | grep -qi 'googlevideo\.com\|youtube\.com'; then
+        warn "yt-dlp returned a YouTube URL for a non-YouTube page (likely a trailer) — ignoring"
+        ytdlp_urls=""
+      fi
+    fi
 
     local extracted=""
     extracted=$(extract_with_cdp "$url") || true

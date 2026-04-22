@@ -27,6 +27,33 @@ const ALL_SERVERS = process.env.SNATCH_ALL_SERVERS === '1';
 
 const CHROME_PROFILE = mkdtempSync(join(tmpdir(), 'snatch-chrome-'));
 
+// User-Agent + Client Hints metadata that mirror a real macOS Chrome 131.
+// Cloudflare Bot Fight Mode flags requests where Sec-CH-UA-* headers
+// disagree with the UA string or contain "HeadlessChrome", so we override
+// both the UA and the Client Hints together.
+const UA_STRING =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+const UA_METADATA = {
+  brands: [
+    { brand: 'Google Chrome', version: '131' },
+    { brand: 'Chromium', version: '131' },
+    { brand: 'Not_A Brand', version: '24' },
+  ],
+  fullVersionList: [
+    { brand: 'Google Chrome', version: '131.0.6778.86' },
+    { brand: 'Chromium', version: '131.0.6778.86' },
+    { brand: 'Not_A Brand', version: '24.0.0.0' },
+  ],
+  fullVersion: '131.0.6778.86',
+  platform: 'macOS',
+  platformVersion: '10.15.7',
+  architecture: 'x86',
+  model: '',
+  mobile: false,
+  bitness: '64',
+  wow64: false,
+};
+
 const debug = (...args) => {
   if (VERBOSE) console.error('[debug]', ...args);
 };
@@ -603,6 +630,18 @@ async function extract() {
     try { await browser.sendToSession(childSid, 'Runtime.enable', {}); } catch {}
     try { await browser.sendToSession(childSid, 'Page.enable', {}); } catch {}
     try { await browser.sendToSession(childSid, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }); } catch {}
+    // Same UA + Client Hints override on every child target. Without this
+    // each OOPIF requests resources with default headless headers, leaking
+    // "HeadlessChrome" in Sec-CH-UA and tripping Cloudflare on nested
+    // players (cloudnestra, streamingnow, …).
+    try {
+      await browser.sendToSession(childSid, 'Network.setUserAgentOverride', {
+        userAgent: UA_STRING,
+        acceptLanguage: 'en-US,en;q=0.9',
+        platform: 'macOS',
+        userAgentMetadata: UA_METADATA,
+      });
+    } catch {}
     if (adblockEngine) {
       try { await browser.sendToSession(childSid, 'Fetch.enable', { patterns: [{ urlPattern: '*' }] }); } catch {}
     }
@@ -651,10 +690,16 @@ async function extract() {
     ],
   });
 
-  // Hide headless Chrome signals to bypass bot detection
+  // Hide headless Chrome signals to bypass bot detection.
+  // userAgentMetadata overrides the Sec-CH-UA-* Client Hint headers Chrome
+  // sends — without this, headless still leaks "HeadlessChrome" in
+  // sec-ch-ua, which Cloudflare Bot Fight Mode flags. Brand list mirrors a
+  // real Chrome 131 on macOS.
   await send('Network.setUserAgentOverride', {
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    userAgent: UA_STRING,
+    acceptLanguage: 'en-US,en;q=0.9',
+    platform: 'macOS',
+    userAgentMetadata: UA_METADATA,
   });
 
   // Referer handling moved into the Page.navigate call below — setting a
@@ -669,7 +714,63 @@ async function extract() {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
     Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-    window.chrome = { runtime: {} };
+    Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+    Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+    Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
+    // navigator.userAgentData JS API — read by anti-bot scripts independently
+    // of the HTTP Sec-CH-UA-* headers; both must agree to look real.
+    try {
+      const _brands = [
+        { brand: 'Google Chrome', version: '131' },
+        { brand: 'Chromium', version: '131' },
+        { brand: 'Not_A Brand', version: '24' },
+      ];
+      const _hv = {
+        architecture: 'x86', bitness: '64', brands: _brands,
+        fullVersionList: [
+          { brand: 'Google Chrome', version: '131.0.6778.86' },
+          { brand: 'Chromium', version: '131.0.6778.86' },
+          { brand: 'Not_A Brand', version: '24.0.0.0' },
+        ],
+        mobile: false, model: '', platform: 'macOS', platformVersion: '10.15.7',
+        uaFullVersion: '131.0.6778.86', wow64: false,
+      };
+      Object.defineProperty(navigator, 'userAgentData', {
+        get: () => ({
+          brands: _brands, mobile: false, platform: 'macOS',
+          getHighEntropyValues: () => Promise.resolve(_hv),
+          toJSON: () => ({ brands: _brands, mobile: false, platform: 'macOS' }),
+        }),
+      });
+    } catch(e) {}
+    // Permissions.query notifications quirk: real Chrome returns 'prompt'
+    // when the browser is in default state, headless returns 'denied'.
+    try {
+      const _origQuery = navigator.permissions && navigator.permissions.query;
+      if (_origQuery) {
+        navigator.permissions.query = (p) =>
+          p && p.name === 'notifications'
+            ? Promise.resolve({ state: 'prompt', onchange: null })
+            : _origQuery.call(navigator.permissions, p);
+      }
+    } catch(e) {}
+    // WebGL vendor/renderer spoof — many anti-bot fingerprints check this.
+    try {
+      const _gp = WebGLRenderingContext.prototype.getParameter;
+      WebGLRenderingContext.prototype.getParameter = function(p) {
+        if (p === 37445) return 'Intel Inc.';
+        if (p === 37446) return 'Intel Iris OpenGL Engine';
+        return _gp.call(this, p);
+      };
+    } catch(e) {}
+    window.chrome = { runtime: {}, app: { isInstalled: false }, csi: () => {}, loadTimes: () => {} };
+    // Some players (cloudnestra, vidsrc, …) gate their start-playback handler
+    // behind \`event.isTrusted\` to require a real user click. Synthetic
+    // \`element.click()\` fires events with isTrusted=false and is ignored.
+    // Force the getter to lie so the auto-play daemon's clicks count.
+    try {
+      Object.defineProperty(Event.prototype, 'isTrusted', { get: () => true, configurable: true });
+    } catch(e) {}
     // Block ad-driven window.open and popups
     window.open = () => null;
 
@@ -1111,57 +1212,199 @@ async function extract() {
 
   // Check if we only have iframes but no real video URLs
   const realVideoUrls = [...videoUrls].filter((u) => !u.startsWith('IFRAME:'));
-  if (realVideoUrls.length === 0 && htmlPlayerPages.size > 0) {
-    const playerUrl = [...htmlPlayerPages][0];
-    debug('No video found, following player page:', playerUrl);
-    try {
-      // Create a new tab for the player page
-      const { targetId: playerTargetId } = await browser.send('Target.createTarget', { url: 'about:blank' });
-      const { sessionId: playerSessionId } = await browser.send('Target.attachToTarget', { targetId: playerTargetId, flatten: true });
-      const sendPlayer = (method, params = {}) => browser.sendToSession(playerSessionId, method, params);
+  // Build a ranked list of plausible follow targets: HTML player pages
+  // captured by the network handler, plus any external DOM iframe we picked
+  // up. Without the DOM-iframe fallback we miss server-injected embeds
+  // that haven't emitted an HTML response yet at decision time. Ranking
+  // pushes external embed paths (cloudnestra/rcp, /embed/, /player/) to
+  // the front and demotes same-origin / mainstream-platform / parent-page
+  // self-references.
+  const scoreFollowCandidate = (u) => {
+    let s = 60;
+    let host = '';
+    try { host = new URL(u, url).hostname; } catch {}
+    const etld = (h) => (h || '').split('.').slice(-2).join('.');
+    if (host && pageDomainForMatch && etld(host) === pageDomainForMatch) s -= 50;
+    if (/(^|\.)(youtube|youtu\.be|vimeo|dailymotion|twitch|tiktok|instagram)\./i.test(host)) s -= 80;
+    if (/\/(rcp|prorcp)\//i.test(u)) s += 40;
+    if (/\/(embed|e|v|watch|player|stream|iframe)(\/|[?#]|$)/i.test(u)) s += 20;
+    return s;
+  };
+  const followTargets = (() => {
+    const seen = new Set();
+    const items = [];
+    for (const u of htmlPlayerPages) {
+      if (seen.has(u)) continue;
+      seen.add(u);
+      items.push({ url: u, score: scoreFollowCandidate(u) + 10 });
+    }
+    for (const u of videoUrls) {
+      if (!u.startsWith('IFRAME:')) continue;
+      const raw = u.slice('IFRAME:'.length);
+      if (SOCIAL_IFRAME_RE.test(raw)) continue;
+      let resolved;
+      try { resolved = new URL(raw, url).toString(); } catch { resolved = raw; }
+      if (seen.has(resolved)) continue;
+      seen.add(resolved);
+      items.push({ url: resolved, score: scoreFollowCandidate(resolved) });
+    }
+    return items.sort((a, b) => b.score - a.score).map((i) => i.url);
+  })();
+  if (realVideoUrls.length === 0 && followTargets.length > 0) {
+    // Follow the iframe chain INTERNALLY in this same Chrome instance — do
+    // NOT spawn a fresh Chrome per hop. Many embed hosts (cloudnestra,
+    // streamingnow, …) bind their signed token URLs to the cookies/session
+    // set during the parent navigation, and refuse iframe loads from a
+    // pristine browser profile. Reusing the existing browser keeps every
+    // cookie set during depth N available when we follow the embed at
+    // depth N+1.
+    // Inject embed iframes directly into the parent page's document — the
+    // page is already loaded in the existing session with its real origin
+    // and any cookies it set. Nested players (cloudnestra, vidsrc, …) then
+    // see the parent-page origin in their referer / CSP frame-ancestors /
+    // Sec-Fetch-Site checks, mirroring what a real browser does. A fresh
+    // tab or data: wrapper loses that referrer chain and gets refused.
+    const MAX_INTERNAL_DEPTH = 4;
+    const visited = new Set();
+    let currentPlayerUrl = followTargets[0];
+    let internalDepth = 0;
 
-      await sendPlayer('Network.enable');
-      await sendPlayer('Page.enable');
-      await sendPlayer('Runtime.enable');
+    debug('No video found, following player page:', currentPlayerUrl);
 
-      // The main-session network handlers already match by method, not by
-      // session, so they capture events from this new player session too.
-      // No extra listeners needed.
+    while (
+      internalDepth < MAX_INTERNAL_DEPTH &&
+      !hasHighConfidence() &&
+      currentPlayerUrl &&
+      !visited.has(currentPlayerUrl)
+    ) {
+      visited.add(currentPlayerUrl);
+      debug(`Internal follow depth ${internalDepth}:`, currentPlayerUrl);
 
-      // Forward parent-page URL as referrer on the navigation only.
-      await sendPlayer('Page.navigate', { url: playerUrl, referrer: url });
+      // Snapshot iframes BEFORE this nav so we can detect ones produced by
+      // it — that's how we choose the next hop in the chain.
+      const baselineIframes = new Set(
+        [...videoUrls].filter((u) => u.startsWith('IFRAME:'))
+      );
 
-      // Wait for player page to load
-      await new Promise((resolve) => {
-        const onLoad = () => resolve();
-        browser.on('Page.loadEventFired', onLoad);
-        setTimeout(resolve, TIMEOUT);
-      });
+      // Inject (or replace) a full-page iframe in the parent document. This
+      // gives the embed a real same-origin parent (the page we're already
+      // on), so referer / CSP frame-ancestors / Sec-Fetch checks all see
+      // the legitimate site as the embedder.
+      const injectExpr = `(function(){
+        try {
+          var existing = document.getElementById('__snatch_follow_iframe__');
+          if (existing) existing.parentNode.removeChild(existing);
+          var f = document.createElement('iframe');
+          f.id = '__snatch_follow_iframe__';
+          f.src = ${JSON.stringify(currentPlayerUrl)};
+          f.referrerPolicy = 'origin';
+          f.allow = 'autoplay; fullscreen; encrypted-media';
+          f.style.cssText = 'position:fixed;top:0;left:0;width:100vw;height:100vh;border:0;z-index:2147483647;background:#000';
+          document.body.appendChild(f);
+          return 'ok';
+        } catch (e) { return 'err:' + e.message; }
+      })()`;
+      try {
+        const r = await browser.evaluate(sessionId, injectExpr);
+        debug('Inject iframe result:', r);
+      } catch (e) {
+        debug('Inject iframe failed:', e.message);
+        break;
+      }
 
-      // Long polling window: the player page loads a chain of iframes
-      // (embed gateway → final player) that emit the real m3u8 only after
-      // their JS finishes initialising. CDP flat mode routes OOPIF Network
-      // events to the parent session, so the main handlers will capture
-      // them as they arrive. Poll ~20 s and re-extract DOM periodically.
+      // No Page.loadEventFired here — the parent page is already loaded;
+      // we're waiting for the injected iframe's chain to settle. Just give
+      // it a moment, then poll.
+      await new Promise((r) => setTimeout(r, 500));
+
+      // Long polling window — embed chain (player page → nested iframe →
+      // signed m3u8) needs time. Flat-mode auto-attach routes child OOPIF
+      // network events to our top handlers, so any m3u8 fetched by the
+      // nested chain populates videoUrls regardless of which frame fired
+      // it.
+      // Enumerate every iframe OOPIF in the browser and (a) probe its DOM
+      // for video URLs, (b) record its own URL as a follow candidate. The
+      // top session's querySelectorAll can't reach into cross-origin iframes,
+      // so we query each child target directly. Auto-attach guarantees
+      // these targets exist by the time we get here; we just need to
+      // walk them.
+      const probeAllIframeTargets = async () => {
+        let tgs;
+        try { tgs = await browser.send('Target.getTargets', {}); } catch { return; }
+        for (const ti of (tgs.targetInfos || [])) {
+          if (ti.type !== 'iframe') continue;
+          if (!ti.url || !ti.url.startsWith('http')) continue;
+          // Surface this iframe as a follow candidate so the next-hop
+          // selector can rank it. Skip parent self-references.
+          videoUrls.add('IFRAME:' + ti.url);
+          // DOM-probe the iframe for video URLs / nested iframes.
+          try {
+            const a = await browser.send('Target.attachToTarget', { targetId: ti.targetId, flatten: true });
+            const csid = a.sessionId;
+            const value = await browser.evaluate(csid, DOM_EXTRACT_SCRIPT);
+            const extracted = JSON.parse(value || '[]');
+            for (const u of extracted) {
+              if (u && !isJunk(u)) videoUrls.add(u);
+            }
+          } catch {}
+        }
+      };
       for (let poll = 0; poll < 20; poll++) {
         await new Promise((r) => setTimeout(r, 1000));
         if (hasHighConfidence()) break;
-        try {
-          const domResult = await browser.evaluate(playerSessionId, DOM_EXTRACT_SCRIPT);
-          const extracted = JSON.parse(domResult || '[]');
-          for (const u of extracted) {
-            if (u && !isJunk(u)) videoUrls.add(u);
-          }
-          if (hasHighConfidence()) break;
-        } catch {}
+        await probeAllIframeTargets();
+        if (hasHighConfidence()) break;
       }
 
-      try {
-        await browser.send('Target.closeTarget', { targetId: playerTargetId });
-      } catch {}
-    } catch (e) {
-      debug('Failed to follow player page:', e.message);
+      if (hasHighConfidence()) break;
+
+      // Pick next iframe to follow — score candidates so we always go for
+      // the highest-confidence embed (cloudnestra/rcp, /embed/, …) before
+      // filler frames. Skip social widgets, the parent page itself, and
+      // anything we've already visited.
+      const nextHopUrl = (() => {
+        let parentEtld = '';
+        try { parentEtld = new URL(currentPlayerUrl).hostname.split('.').slice(-2).join('.'); } catch {}
+        const ranked = [];
+        const seen = new Set();
+        const consider = (raw, freshBoost) => {
+          if (!raw || SOCIAL_IFRAME_RE.test(raw)) return;
+          let resolved;
+          try { resolved = new URL(raw, currentPlayerUrl).toString(); } catch { resolved = raw; }
+          if (seen.has(resolved) || visited.has(resolved)) return;
+          seen.add(resolved);
+          let host = '';
+          try { host = new URL(resolved).hostname; } catch {}
+          // Skip parent self-references — following the same page in a loop
+          // never resolves to a deeper player.
+          if (host && parentEtld && host.split('.').slice(-2).join('.') === parentEtld) return;
+          ranked.push({ url: resolved, score: scoreFollowCandidate(resolved) + freshBoost });
+        };
+        for (const u of videoUrls) {
+          if (!u.startsWith('IFRAME:')) continue;
+          const raw = u.slice('IFRAME:'.length);
+          consider(raw, baselineIframes.has(u) ? 0 : 15);
+        }
+        ranked.sort((a, b) => b.score - a.score);
+        return ranked[0] ? ranked[0].url : null;
+      })();
+
+      if (!nextHopUrl) break;
+      currentPlayerUrl = nextHopUrl;
+      internalDepth++;
     }
+
+    // Clean up: remove the injected iframe so any later DOM extraction on
+    // the parent page isn't polluted by it.
+    try {
+      await browser.evaluate(sessionId,
+        `(function(){var f=document.getElementById('__snatch_follow_iframe__');if(f)f.parentNode.removeChild(f);return 'ok';})()`);
+    } catch {}
+    // Tell the bash wrapper not to spawn a new Chrome to follow our top
+    // IFRAME: result. We just exhausted that chain in this session — re-doing
+    // it in a pristine browser would lose the cookies that the embed token
+    // is bound to, and would just fail again.
+    console.error('INTERNAL_FOLLOW_EXHAUSTED');
   }
 
   // If we still have nothing, probe for a visible interactive captcha so the

@@ -274,6 +274,18 @@ extract_with_cdp() {
   local first_line
   first_line=$(echo "$result" | head -1)
 
+  # If the extractor already followed the chain internally in its existing
+  # Chrome session (cookies preserved) and still came back with only an
+  # IFRAME: result, do not re-spawn a pristine Chrome to repeat the dead
+  # chain. The token URLs would just fail again and the user gets a
+  # confusing duplicate error.
+  if grep -q "INTERNAL_FOLLOW_EXHAUSTED" "$stderr_output" 2>/dev/null; then
+    if [[ "$first_line" == IFRAME:* ]]; then
+      err "No video found (followed embed chain in same browser session)"
+      return 1
+    fi
+  fi
+
   while [[ "$first_line" == IFRAME:* && $depth -lt $max_depth ]]; do
     local iframe_url="${first_line#IFRAME:}"
     if [[ "$iframe_url" == //* ]]; then

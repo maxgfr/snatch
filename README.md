@@ -89,4 +89,4 @@ Everything yt-dlp supports (1800+ sites), plus any site that loads video via sta
 
 ## License
 
-MIT
+[MIT](LICENSE)

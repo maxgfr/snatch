@@ -19,6 +19,10 @@ const COOKIES_FILE = process.env.SNATCH_COOKIES || '';
 // Referer passed in from the parent page during iframe recursion — some
 // embed hosts (cloudnestra, streamtape, …) 403 without a matching Referer.
 const REFERER = process.env.SNATCH_REFERER || '';
+// When set, exhaustively click every server candidate instead of breaking on
+// the first high-confidence URL. Used by `snatch -a` / `snatch -i` so the
+// user gets fallback URLs when the default server is dead.
+const ALL_SERVERS = process.env.SNATCH_ALL_SERVERS === '1';
 
 const CHROME_PROFILE = mkdtempSync(join(tmpdir(), 'snatch-chrome-'));
 
@@ -843,11 +847,12 @@ async function extract() {
 
       // Click candidates one at a time with a long polling window so the
       // first-clicked embed has time to emit its signed m3u8/mpd request.
-      // Stop as soon as we have a high-confidence URL, so subsequent clicks
-      // don't stomp the iframe src mid-load.
+      // Default mode stops on the first high-confidence URL; with
+      // ALL_SERVERS we keep clicking every server so the user gets every
+      // fallback (useful when the default server is dead).
       const MAX_SERVERS = Math.min(candidates.length, 5);
       for (let i = 0; i < MAX_SERVERS; i++) {
-        if (hasHighConfidence()) break;
+        if (!ALL_SERVERS && hasHighConfidence()) break;
         const c = candidates[i];
         const clickExpr =
           c.type === 'fn'
@@ -865,14 +870,15 @@ async function extract() {
         // 3-10 s for the embed to initialize and emit m3u8/mpd requests;
         // we poll every 500 ms and break as soon as a signed streaming URL
         // shows up, so we don't stomp on it with the next server click.
-        // Inner wait: only break on a high-confidence real URL. We keep
-        // waiting even if an iframe appears, because streaming embeds load
-        // in two phases (iframe DOM swap → player init → signed m3u8) and
-        // we want to catch the m3u8 in the top-level Network listener
-        // before moving on.
+        // Inner wait: with ALL_SERVERS, wait the full window so each
+        // server has time to emit its own signed m3u8. In default mode,
+        // break early on the first high-confidence hit. We never break
+        // on iframe-appearance alone — streaming embeds load in two
+        // phases (iframe DOM swap → player init → signed m3u8) and we
+        // want the m3u8 on the top-level Network listener.
         for (let w = 0; w < 16; w++) {
           await new Promise((r) => setTimeout(r, 500));
-          if (hasHighConfidence()) break;
+          if (!ALL_SERVERS && hasHighConfidence()) break;
         }
         try {
           const domResult = await browser.evaluate(sessionId, DOM_EXTRACT_SCRIPT);

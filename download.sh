@@ -24,6 +24,8 @@ DRY_RUN=false
 VERBOSE=false
 COOKIES=""
 QUALITY=""
+ALL_SERVERS=false
+INTERACTIVE=false
 
 # --- Cleanup ---------------------------------------------------------------
 
@@ -56,6 +58,10 @@ Options:
   -q, --quality <fmt>   Quality/format selector (passed to yt-dlp -f)
   -c, --cookies <file>  Cookies file (Netscape format, passed to yt-dlp & CDP)
   -n, --dry-run         Extract video URLs without downloading
+  -a, --all-servers     Try every server on streaming sites (slower, finds
+                        fallbacks when the default server is dead)
+  -i, --interactive     Try every server and prompt for which URL to use
+                        (implies -a)
   -d, --verbose         Enable verbose/debug output
   -h, --help            Show this help
   -v, --version         Show version
@@ -66,6 +72,7 @@ Examples:
   snatch -n 'https://example.com/video'
   snatch -q 'bestvideo[height<=720]+bestaudio' 'https://youtube.com/watch?v=...'
   snatch -c cookies.txt 'https://premium-site.com/video'
+  snatch -i 'https://streamer.com/episode'   # pick a server interactively
 EOF
   exit 0
 }
@@ -94,6 +101,8 @@ parse_args() {
         if [[ $# -lt 2 ]]; then err "Missing value for $1"; exit 1; fi
         COOKIES="$2"; shift 2 ;;
       -n|--dry-run) DRY_RUN=true; shift ;;
+      -a|--all-servers) ALL_SERVERS=true; shift ;;
+      -i|--interactive) INTERACTIVE=true; ALL_SERVERS=true; shift ;;
       -d|--verbose) VERBOSE=true; shift ;;
       -*) err "Unknown option: $1"; usage_short ;;
       *) URL="$1"; shift ;;
@@ -197,6 +206,7 @@ extract_with_cdp() {
   local env_args=()
   if $VERBOSE; then env_args+=(SNATCH_VERBOSE=1); fi
   if [ -n "$COOKIES" ]; then env_args+=(SNATCH_COOKIES="$COOKIES"); fi
+  if $ALL_SERVERS; then env_args+=(SNATCH_ALL_SERVERS=1); fi
 
   local result
   if [ ${#env_args[@]} -gt 0 ]; then
@@ -407,9 +417,43 @@ main() {
     exit 1
   fi
 
-  # Take the best URL (first line = highest priority)
+  # Interactive picker — list every extracted URL and let the user choose.
   local best_url
-  best_url=$(echo "$extracted" | head -1)
+  if $INTERACTIVE; then
+    local -a urls=()
+    while IFS= read -r line; do
+      [ -n "$line" ] && urls+=("$line")
+    done <<< "$extracted"
+
+    if [ ${#urls[@]} -eq 0 ]; then
+      err "No video URL found on this page"
+      exit 1
+    fi
+
+    if [ ${#urls[@]} -eq 1 ]; then
+      best_url="${urls[0]}"
+      log "Only one URL found, using it: $best_url"
+    else
+      log "Multiple sources found — pick one to download:"
+      local i=1
+      for u in "${urls[@]}"; do
+        echo "  [$i] $u" >&2
+        i=$((i + 1))
+      done
+      local choice
+      read -rp "Choice [1]: " choice </dev/tty
+      choice="${choice:-1}"
+      if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#urls[@]} ]; then
+        err "Invalid choice: $choice"
+        exit 1
+      fi
+      best_url="${urls[$((choice - 1))]}"
+    fi
+  else
+    # Take the best URL (first line = highest priority)
+    best_url=$(echo "$extracted" | head -1)
+  fi
+
   log "Found video: $best_url"
 
   # Step 3: Download the extracted URL

@@ -6,6 +6,7 @@ import { readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import WebSocket from 'ws';
+import { FiltersEngine, Request as AdblockRequest } from '@ghostery/adblocker';
 
 const url = process.argv[2];
 if (!url) {
@@ -48,7 +49,7 @@ class CDPClient {
         else resolve(msg.result);
       } else if (msg.method) {
         const handlers = this.events.get(msg.method) || [];
-        for (const h of handlers) h(msg.params);
+        for (const h of handlers) h(msg.params, msg.sessionId);
       }
     });
   }
@@ -199,6 +200,10 @@ function launchChrome() {
     `--user-data-dir=${CHROME_PROFILE}`,
     '--remote-debugging-port=0',
     '--mute-audio',
+    // Let the auto-play daemon actually start playback — without this,
+    // Chrome's autoplay policy rejects video.play() when no user gesture
+    // has occurred, so players like cloudnestra never fetch their m3u8.
+    '--autoplay-policy=no-user-gesture-required',
     '--window-size=1920,1080',
     '--block-new-web-contents',
     '--disable-popup-blocking=false',
@@ -526,6 +531,56 @@ async function extract() {
   await send('Page.enable');
   await send('Runtime.enable');
 
+  // --- Ad/tracker blocker (EasyList + EasyPrivacy) -----------------------
+  // Full blocklist loaded from @ghostery/adblocker. We intercept every
+  // request via Fetch.enable, test against the engine, and fail ad/tracker
+  // requests instead of letting them load. Streaming sites pile on pre-roll
+  // ads, pop-unders, and analytics that delay or outright block the real
+  // player — blocking them upfront often lets the player initialize and
+  // emit its signed m3u8.
+  let adblockEngine = null;
+  try {
+    adblockEngine = await FiltersEngine.fromPrebuiltAdsAndTracking(fetch);
+    debug('Adblocker engine loaded');
+  } catch (e) {
+    debug('Adblocker engine load failed:', e.message);
+  }
+
+  if (adblockEngine) {
+    await send('Fetch.enable', { patterns: [{ urlPattern: '*' }] });
+    const setupAdblockForSession = (sid) => {
+      browser.sendToSession(sid, 'Fetch.enable', { patterns: [{ urlPattern: '*' }] }).catch(() => {});
+    };
+    const reply = (method, p, sid) => {
+      if (sid) return browser.sendToSession(sid, method, p).catch(() => {});
+      return browser.send(method, p).catch(() => {});
+    };
+    browser.on('Fetch.requestPaused', async (params, sid) => {
+      const reqId = params.requestId;
+      const reqUrl = params.request?.url || '';
+      const resourceType = (params.resourceType || 'other').toLowerCase();
+      // Keep direct media/manifest requests — never block the real video.
+      if (resourceType === 'media' ||
+          /\.m3u8|\.mpd|mpegurl|master\.m3u8|chunklist/i.test(reqUrl)) {
+        reply('Fetch.continueRequest', { requestId: reqId }, sid);
+        return;
+      }
+      try {
+        const r = AdblockRequest.fromRawDetails({
+          url: reqUrl,
+          type: resourceType,
+          sourceUrl: url,
+        });
+        const { match } = adblockEngine.match(r);
+        if (match) {
+          reply('Fetch.failRequest', { requestId: reqId, errorReason: 'BlockedByClient' }, sid);
+          return;
+        }
+      } catch {}
+      reply('Fetch.continueRequest', { requestId: reqId }, sid);
+    });
+  }
+
   // Auto-attach to every OOPIF / sub-target in flat mode. Without this,
   // cross-origin iframes (cloudnestra nested inside vsembed, vidcdn nested
   // inside tinyzonetv, etc.) may run as out-of-process frames that don't
@@ -548,6 +603,9 @@ async function extract() {
     try { await browser.sendToSession(childSid, 'Runtime.enable', {}); } catch {}
     try { await browser.sendToSession(childSid, 'Page.enable', {}); } catch {}
     try { await browser.sendToSession(childSid, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }); } catch {}
+    if (adblockEngine) {
+      try { await browser.sendToSession(childSid, 'Fetch.enable', { patterns: [{ urlPattern: '*' }] }); } catch {}
+    }
     // Re-inject stealth + auto-play daemon into every sub-frame, so nested
     // players (cloudnestra, vidcdn, …) also auto-play and emit m3u8.
     try {

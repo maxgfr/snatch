@@ -4,3 +4,4 @@ node_modules/
 *.webm
 *.ts
 !extract_video_url.mjs
+.DS_Store

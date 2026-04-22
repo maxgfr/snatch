@@ -526,6 +526,47 @@ async function extract() {
   await send('Page.enable');
   await send('Runtime.enable');
 
+  // Auto-attach to every OOPIF / sub-target in flat mode. Without this,
+  // cross-origin iframes (cloudnestra nested inside vsembed, vidcdn nested
+  // inside tinyzonetv, etc.) may run as out-of-process frames that don't
+  // route Network events to our top session. Flat auto-attach also makes
+  // our Page.addScriptToEvaluateOnNewDocument injection propagate to
+  // sub-frames, which is what lets the auto-play daemon reach nested
+  // players and trigger m3u8 fetches.
+  await send('Target.setAutoAttach', {
+    autoAttach: true,
+    waitForDebuggerOnStart: false,
+    flatten: true,
+  });
+  // When a child target attaches, enable Network/Page/Runtime on it too so
+  // its events reach the top event bus. In flat mode all sessions share
+  // the same WebSocket so the existing method handlers fire regardless of
+  // which session the event came from.
+  browser.on('Target.attachedToTarget', async (params) => {
+    const childSid = params.sessionId;
+    try { await browser.sendToSession(childSid, 'Network.enable', {}); } catch {}
+    try { await browser.sendToSession(childSid, 'Runtime.enable', {}); } catch {}
+    try { await browser.sendToSession(childSid, 'Page.enable', {}); } catch {}
+    try { await browser.sendToSession(childSid, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }); } catch {}
+    // Re-inject stealth + auto-play daemon into every sub-frame, so nested
+    // players (cloudnestra, vidcdn, …) also auto-play and emit m3u8.
+    try {
+      await browser.sendToSession(childSid, 'Page.addScriptToEvaluateOnNewDocument', {
+        source: STEALTH_AND_AUTOPLAY_SOURCE,
+      });
+    } catch {}
+    // If the child frame has already committed a document, re-run the
+    // daemon manually since addScriptToEvaluateOnNewDocument only takes
+    // effect on NEW navigations.
+    try {
+      await browser.sendToSession(childSid, 'Runtime.evaluate', {
+        expression: STEALTH_AND_AUTOPLAY_SOURCE,
+        returnByValue: false,
+        awaitPromise: false,
+      });
+    } catch {}
+  });
+
   // Network-layer blocklist — CDP only supports `*` wildcards so we use
   // generic ad/analytics patterns. Keeps ad scripts from triggering popup
   // redirects during headless extraction. Extraction-time filtering handles
@@ -562,16 +603,58 @@ async function extract() {
   // global extra header would leak the parent-page Referer onto every
   // sub-resource request, which trips anti-hotlink logic on some embed
   // hosts (e.g. vidcdn.co returns an interstitial).
-  await send('Page.addScriptToEvaluateOnNewDocument', {
-    source: `
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-      Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-      Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-      window.chrome = { runtime: {} };
-      // Block ad-driven window.open and popups
-      window.open = () => null;
-    `,
-  });
+  // Runs on every new document — top frame AND every iframe. Anti-bot
+  // stealth + an auto-play daemon so nested player iframes (cloudnestra,
+  // vidcdn, weneverbeenfree, etc.) fetch their signed m3u8 without
+  // requiring user interaction.
+  const STEALTH_AND_AUTOPLAY_SOURCE = `
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+    Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+    window.chrome = { runtime: {} };
+    // Block ad-driven window.open and popups
+    window.open = () => null;
+
+    // Auto-play daemon: click any play/consent button and force HTMLVideo
+    // elements to play. Runs multiple times at staggered intervals so
+    // late-mounted players (JWPlayer, playerjs, dash.js, Plyr…) catch up.
+    (function() {
+      const PLAY_SEL = [
+        '.vjs-big-play-button','.ytp-large-play-button',
+        '[class*="play-button" i]','[class*="play_button" i]',
+        '[aria-label*="play" i]','button[class*="play" i]',
+        '.jw-icon-display','.plyr__control--overlaid','.flowplayer .fp-ui',
+        '#pl_but','.play','[id*="player" i] [class*="play"]',
+      ];
+      const CONSENT_SEL = [
+        '[id*="accept" i][id*="cookie" i]',
+        'button[id*="accept" i]','button[class*="accept" i]',
+        '[aria-label*="accept" i]','[aria-label*="agree" i]',
+        '#onetrust-accept-btn-handler','.cc-accept','.cc-allow','.gdpr-accept',
+      ];
+      function tick() {
+        try {
+          for (const s of CONSENT_SEL) {
+            const b = document.querySelector(s);
+            if (b && b.offsetParent !== null) { try { b.click(); } catch(e) {} break; }
+          }
+          for (const s of PLAY_SEL) {
+            const b = document.querySelector(s);
+            if (b && b.offsetParent !== null) { try { b.click(); } catch(e) {} }
+          }
+          document.querySelectorAll('video').forEach(v => {
+            try { v.muted = true; const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch(e) {}
+          });
+        } catch(e) {}
+      }
+      // Kick on DOMContentLoaded + at multiple delays to catch late-init
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', tick, { once: true });
+      } else { tick(); }
+      [1000, 3000, 6000, 10000, 15000].forEach(ms => setTimeout(tick, ms));
+    })();
+  `;
+  await send('Page.addScriptToEvaluateOnNewDocument', { source: STEALTH_AND_AUTOPLAY_SOURCE });
 
   // Inject cookies if provided
   if (COOKIES_FILE) {
@@ -829,6 +912,12 @@ async function extract() {
             '[data-box*="serv"] ~ * li,.player_nav a[href^="#tab"],' +
             '.idTabs a,[id^="Nav_"][href^="#"],[class*="server-item"],' +
             '[class*="serverItem"],[class*="srv"],[data-id*="server"]';
+          // Collect structural candidates with a "selected" flag so we can
+          // prioritize the default server (e.g. lookmovie ships with
+          // #Nav_Easycloud.selected — the page expects that one to be
+          // loaded first; clicking other servers before it disrupts the
+          // expected iframe-chain).
+          const structCands = [];
           let idx = 0;
           for (const el of document.querySelectorAll(structuralSel)) {
             if (el.offsetParent === null) continue;
@@ -836,23 +925,49 @@ async function extract() {
             const cls = (el.className || '').toString().toLowerCase();
             if (/trailer|preview|teaser/.test(label + ' ' + cls)) continue;
             el.setAttribute('data-snatch-idx', String(idx));
-            cands.push({type:'sel', sel: '[data-snatch-idx="' + idx + '"]', label: label.slice(0,30)});
+            const selected = /\\bselected\\b|\\bactive\\b/i.test(cls) || el.getAttribute('aria-selected') === 'true';
+            structCands.push({type:'sel', sel:'[data-snatch-idx="' + idx + '"]', label: label.slice(0,30), selected});
             idx++;
           }
-          return JSON.stringify(cands);
+          // Selected-first: move any .selected/.active server to the very
+          // front of the candidate list, before fn-type loaders.
+          const selected = structCands.filter(c => c.selected);
+          const others = structCands.filter(c => !c.selected);
+          const finalCands = [...selected, ...cands, ...others];
+          return JSON.stringify(finalCands);
         })()`
       );
       const candidates = JSON.parse(enumResult || '[]');
       debug('Server candidates:', candidates.length);
 
+      // Baseline: iframes present before any server click. Anything beyond
+      // this set is "produced by a click" — if a click yields a fresh
+      // external iframe in default mode, we trust it and stop clicking so
+      // subsequent clicks don't overwrite its iframe src.
+      const baselineIframes = new Set(
+        [...videoUrls].filter((u) => u.startsWith('IFRAME:'))
+      );
+      const hasFreshExternalIframe = () =>
+        [...videoUrls].some((u) => {
+          if (!u.startsWith('IFRAME:') || baselineIframes.has(u)) return false;
+          const raw = u.slice('IFRAME:'.length);
+          if (SOCIAL_IFRAME_RE.test(raw)) return false;
+          try {
+            const h = new URL(raw, `https://${pageHostForMatch}`).hostname;
+            const d = h.split('.').slice(-2).join('.');
+            return !!d && d !== pageDomainForMatch;
+          } catch { return false; }
+        });
+
       // Click candidates one at a time with a long polling window so the
       // first-clicked embed has time to emit its signed m3u8/mpd request.
-      // Default mode stops on the first high-confidence URL; with
-      // ALL_SERVERS we keep clicking every server so the user gets every
-      // fallback (useful when the default server is dead).
+      // Default mode stops on the first high-confidence URL OR as soon as
+      // a fresh external iframe appears (trust the default/selected
+      // server's iframe chain to complete; further clicks overwrite it).
+      // ALL_SERVERS keeps going so the user sees every fallback.
       const MAX_SERVERS = Math.min(candidates.length, 5);
       for (let i = 0; i < MAX_SERVERS; i++) {
-        if (!ALL_SERVERS && hasHighConfidence()) break;
+        if (!ALL_SERVERS && (hasHighConfidence() || hasFreshExternalIframe())) break;
         const c = candidates[i];
         const clickExpr =
           c.type === 'fn'
@@ -888,6 +1003,20 @@ async function extract() {
           }
         } catch (e) {
           debug('Post-click DOM extract error:', e.message);
+        }
+      }
+
+      // After server clicks, if we have a fresh external iframe but no
+      // signed URL yet, wait long enough for the nested embed chain
+      // (iframe → player init → signed m3u8) to finish. Without this
+      // extra window, sites like lookmovie → vsembed → cloudnestra → final
+      // player don't get time to emit the m3u8 to our top Network
+      // listener (which flat-mode OOPIF attachment routes through).
+      if (!hasHighConfidence() && hasFreshExternalIframe()) {
+        debug('Fresh embed iframe present, waiting for nested player to emit m3u8...');
+        for (let w = 0; w < 40; w++) {
+          await new Promise((r) => setTimeout(r, 500));
+          if (hasHighConfidence()) break;
         }
       }
     } catch (e) {

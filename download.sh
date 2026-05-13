@@ -152,6 +152,10 @@ build_ytdlp_args() {
     --no-warnings
     --progress
     --concurrent-fragments 4
+    --retries 20
+    --fragment-retries 30
+    --retry-sleep "linear=1:5:1"
+    --retry-sleep "fragment:linear=1:5:1"
   )
   if [ -n "$OUTPUT" ]; then
     _arr+=(-o "${OUTPUT}.%(ext)s")
@@ -338,6 +342,13 @@ download_extracted_url() {
   local ytdlp_args=()
   build_ytdlp_args ytdlp_args
   ytdlp_args+=(--referer "$referer")
+
+  # When the user didn't pass -o, the generic extractor would use the raw m3u8
+  # URL (with query string) as title — that blows past the 255-byte filename
+  # limit. Force a sane template derived from the source page.
+  if [ -z "$OUTPUT" ]; then
+    ytdlp_args+=(-o "%(extractor)s-%(id).100B.%(ext)s")
+  fi
 
   debug "Downloading extracted URL: $video_url (referer: $referer)"
 

@@ -50,7 +50,10 @@ assert_output() {
 # --- Helper: source only functions from download.sh (skip main) ------------
 
 source_functions() {
-  eval "$(sed 's/^main "\$@"//' "$SCRIPT")"
+  # download.sh skips its CLI entrypoint when this is set, so the functions
+  # can be loaded as a library. Beats stripping `main "$@"` with sed, which
+  # broke the moment that line was indented.
+  SNATCH_SOURCE_ONLY=1 . "$SCRIPT"
 }
 
 echo "=== snatch CLI tests ==="
@@ -174,6 +177,93 @@ assert_exit "extract_video_url.mjs syntax valid" 0 \
 # --- Function unit tests (sourced in subshell) -----------------------------
 
 echo ""
+# --- Extraction plan rendering ---------------------------------------------
+# `--render` is a pure JSON→argv function with no browser, so it is fully
+# testable here. It is the seam download.sh depends on for the Referer, UA and
+# cookie jar that make a CDP-extracted URL downloadable.
+
+echo ""
+echo "-- extraction plan rendering --"
+
+PLAN_FIXTURE=$(mktemp)
+cat > "$PLAN_FIXTURE" <<'PLANEOF'
+{
+  "version": 1,
+  "page_url": "https://site.test/watch/42",
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/131.0.0.0 Safari/537.36",
+  "cookie_jar": "/tmp/snatch-jar.txt",
+  "internal_follow_exhausted": false,
+  "candidates": [
+    {
+      "url": "https://cdn.test/hls/master.m3u8?token=abc",
+      "kind": "video", "score": 250, "format": "hls", "manifest": "master",
+      "qualities": ["1080p", "720p"], "drm": false,
+      "referer": "https://embed.test/e/xyz", "origin": "https://embed.test",
+      "frame_url": "https://embed.test/e/xyz", "http_status": 200,
+      "content_type": "application/vnd.apple.mpegurl", "verified": "ok",
+      "ytdlp_args": ["--referer", "https://embed.test/e/xyz",
+                     "--user-agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/131.0.0.0 Safari/537.36",
+                     "--add-headers", "Origin:https://embed.test",
+                     "--cookies", "/tmp/snatch-jar.txt"]
+    },
+    {
+      "url": "https://cdn.test/hls/dead.m3u8?token=old",
+      "kind": "video", "score": -50, "format": "hls", "manifest": null,
+      "qualities": [], "drm": true,
+      "referer": "https://embed.test/e/xyz", "origin": "https://embed.test",
+      "frame_url": "https://embed.test/e/xyz", "http_status": 403,
+      "content_type": "text/plain", "verified": "failed",
+      "ytdlp_args": ["--referer", "https://embed.test/e/xyz"]
+    },
+    {
+      "url": "IFRAME:https://embed.test/e/xyz",
+      "kind": "iframe", "score": 70, "format": "other", "manifest": null,
+      "qualities": [], "drm": false, "referer": "", "origin": "",
+      "frame_url": "", "http_status": null, "content_type": "",
+      "verified": "unverified", "ytdlp_args": []
+    }
+  ]
+}
+PLANEOF
+
+RENDER=(node ./extract_video_url.mjs --render "$PLAN_FIXTURE")
+
+assert_output "render list annotates format, manifest and status" \
+  "hls master 1080p/720p ✓200" "${RENDER[@]}" list
+assert_output "render list marks a failed candidate" \
+  "✗403" "${RENDER[@]}" list
+assert_output "render list marks an unverified iframe" \
+  "\[iframe \?\]" "${RENDER[@]}" list
+
+assert_output "render cmd emits a shell-quoted yt-dlp command" \
+  "^yt-dlp .*'--referer' 'https://embed.test/e/xyz'" "${RENDER[@]}" cmd 0
+assert_output "render cmd puts the URL last" \
+  "'https://cdn.test/hls/master.m3u8\?token=abc'$" "${RENDER[@]}" cmd 0
+
+assert_output "render get reads a candidate field" "^master$" "${RENDER[@]}" get 0 manifest
+assert_output "render get joins array fields"      "^1080p 720p$" "${RENDER[@]}" get 0 qualities
+assert_output "render get reports DRM"             "^true$" "${RENDER[@]}" get 1 drm
+assert_output "render get falls back to plan-level fields" \
+  "Chrome/131" "${RENDER[@]}" get 0 user_agent
+
+assert_exit "render rejects a missing plan file" 1 \
+  node ./extract_video_url.mjs --render /nonexistent/plan.json args 0
+assert_exit "render rejects an out-of-range index" 1 "${RENDER[@]}" args 99
+assert_exit "render rejects an unknown mode" 1 "${RENDER[@]}" bogus 0
+
+# The command it prints must be syntactically valid shell, or the "copy this"
+# promise of dry-run mode is a lie.
+"${RENDER[@]}" cmd 0 > "$PLAN_FIXTURE.cmd"
+assert_exit "the rendered command is valid shell" 0 bash -n "$PLAN_FIXTURE.cmd"
+
+# args mode is NUL-separated: a UA full of spaces must survive as ONE argv
+# entry. Counting the NULs is the direct check.
+NARGS=$("${RENDER[@]}" args 0 | tr -dc '\0' | wc -c | tr -d ' ')
+assert_output "render args emits 8 NUL-terminated arguments" "^8$" echo "$NARGS"
+
+rm -f "$PLAN_FIXTURE" "$PLAN_FIXTURE.cmd"
+
+echo ""
 echo "-- function unit tests --"
 
 FUNC_RESULTS=$(mktemp)
@@ -264,6 +354,86 @@ trap "rm -f $FUNC_RESULTS" EXIT
   build_ytdlp_args _t
   args="${_t[*]}"
   run_test "build_ytdlp_args all options" "$(echo "$args" | grep -q "v.%(ext)s" && echo "$args" | grep -q "\-f q" && echo "$args" | grep -q "\-\-cookies c" && echo true || echo false)"
+
+  # --- plan helpers -------------------------------------------------------
+  # These decide what identity the downloader presents to the CDN, so their
+  # failure modes matter more than their happy path.
+
+  PF=$(mktemp)
+  cat > "$PF" <<'PLANEOF2'
+{
+  "version": 1,
+  "page_url": "https://site.test/watch/42",
+  "user_agent": "UA With Spaces/1.0",
+  "cookie_jar": "/tmp/jar.txt",
+  "candidates": [
+    { "url": "https://cdn.test/master.m3u8", "kind": "video",
+      "referer": "https://embed.test/e/xyz", "origin": "https://embed.test",
+      "drm": false,
+      "ytdlp_args": ["--referer", "https://embed.test/e/xyz",
+                     "--user-agent", "UA With Spaces/1.0"] }
+  ]
+}
+PLANEOF2
+
+  URL="https://site.test/watch/42"
+  VERBOSE=false
+  PLAN_JSON="$PF"
+
+  plan_ytdlp_args _pa 0
+  run_test "plan_ytdlp_args uses the frame referer, not the page" \
+    "$(echo "${_pa[*]}" | grep -q "https://embed.test/e/xyz" && echo true || echo false)"
+  # The UA has spaces; if the NUL transport were broken it would arrive split.
+  run_test "plan_ytdlp_args keeps a spaced value as one argument" \
+    "$([ "${_pa[3]}" = "UA With Spaces/1.0" ] && echo true || echo false)"
+
+  PLAN_JSON="/nonexistent/plan.json"
+  plan_ytdlp_args _pb 0
+  run_test "plan_ytdlp_args falls back to the page referer with no plan" \
+    "$([ "${_pb[*]}" = "--referer https://site.test/watch/42" ] && echo true || echo false)"
+
+  echo 'this is not json' > "$PF.bad"
+  PLAN_JSON="$PF.bad"
+  plan_ytdlp_args _pc 0
+  run_test "plan_ytdlp_args survives a corrupt plan" \
+    "$([ "${_pc[*]}" = "--referer https://site.test/watch/42" ] && echo true || echo false)"
+
+  PLAN_JSON="$PF"
+  plan_ytdlp_args _pd 99
+  run_test "plan_ytdlp_args falls back on an out-of-range index" \
+    "$([ "${_pd[*]}" = "--referer https://site.test/watch/42" ] && echo true || echo false)"
+
+  run_test "plan_get reads a candidate field" \
+    "$([ "$(plan_get 0 origin)" = "https://embed.test" ] && echo true || echo false)"
+
+  # cookie_header_for: domain matching is the part that silently leaks or
+  # drops cookies if it is wrong.
+  JF=$(mktemp)
+  printf '# Netscape HTTP Cookie File\n' > "$JF"
+  printf 'exact.test\tFALSE\t/\tFALSE\t0\thost_only\tv1\n' >> "$JF"
+  printf '.cdn.test\tTRUE\t/\tFALSE\t0\twildcard\tv2\n' >> "$JF"
+  printf '#HttpOnly_.cdn.test\tTRUE\t/\tTRUE\t0\thidden\tv3\n' >> "$JF"
+  printf 'evil.test\tFALSE\t/\tFALSE\t0\tleak\tv4\n' >> "$JF"
+  COOKIE_JAR="$JF"
+
+  H=$(cookie_header_for "https://media.cdn.test/x.m3u8")
+  run_test "cookie_header_for matches a dotted parent domain" \
+    "$(echo "$H" | grep -q "wildcard=v2" && echo true || echo false)"
+  run_test "cookie_header_for includes HttpOnly cookies" \
+    "$(echo "$H" | grep -q "hidden=v3" && echo true || echo false)"
+  run_test "cookie_header_for excludes unrelated domains" \
+    "$(echo "$H" | grep -q "leak=v4" && echo false || echo true)"
+  run_test "cookie_header_for excludes a non-matching host-only cookie" \
+    "$(echo "$H" | grep -q "host_only=v1" && echo false || echo true)"
+  H2=$(cookie_header_for "https://exact.test:8443/x.m3u8")
+  run_test "cookie_header_for matches a host-only cookie, ignoring the port" \
+    "$(echo "$H2" | grep -q "host_only=v1" && echo true || echo false)"
+
+  COOKIE_JAR="/nonexistent/jar.txt"
+  run_test "cookie_header_for is empty with no jar" \
+    "$([ -z "$(cookie_header_for "https://cdn.test/x")" ] && echo true || echo false)"
+
+  rm -f "$PF" "$PF.bad" "$JF"
 
   echo "$p $f" > "$FUNC_RESULTS"
 ) 2>/dev/null

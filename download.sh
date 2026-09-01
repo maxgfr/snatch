@@ -27,6 +27,15 @@ QUALITY=""
 ALL_SERVERS=false
 INTERACTIVE=false
 
+# Extraction plan (JSON) + cookie jar produced by extract_video_url.mjs.
+# We allocate both here rather than letting the extractor mktemp them, so the
+# files live in paths this script owns and its EXIT trap cleans up — the
+# extractor never leaves anything behind. Allocated in main(), because
+# extract_with_cdp runs inside a command substitution (a subshell) and any
+# assignment made there would be lost.
+PLAN_JSON=""
+COOKIE_JAR=""
+
 # --- Cleanup ---------------------------------------------------------------
 
 TMPFILES=()
@@ -211,6 +220,12 @@ extract_with_cdp() {
   if $VERBOSE; then env_args+=(SNATCH_VERBOSE=1); fi
   if [ -n "$COOKIES" ]; then env_args+=(SNATCH_COOKIES="$COOKIES"); fi
   if $ALL_SERVERS; then env_args+=(SNATCH_ALL_SERVERS=1); fi
+  # Ask the extractor for the full plan: per-URL Referer/Origin of the frame
+  # that actually fetched it, plus the browser's cookie jar. Each iframe hop
+  # below reuses these same paths, so the last hop — the one that produced
+  # the URLs we return — is the one whose context we keep.
+  if [ -n "$PLAN_JSON" ]; then env_args+=(SNATCH_JSON_OUT="$PLAN_JSON"); fi
+  if [ -n "$COOKIE_JAR" ]; then env_args+=(SNATCH_COOKIE_JAR="$COOKIE_JAR"); fi
 
   local result
   if [ ${#env_args[@]} -gt 0 ]; then
@@ -335,13 +350,89 @@ extract_with_cdp() {
   return 0
 }
 
+# --- Extraction plan helpers ----------------------------------------------
+# The plan is what makes a CDP-extracted URL actually downloadable: the
+# Referer/Origin of the *frame that fetched it* (for a nested embed that is
+# the embed host, not the page the user typed), the Chrome UA the token was
+# issued to, and the session cookie jar. Reading it goes through the
+# extractor's `--render` mode so bash never parses JSON and `jq` stays out of
+# the dependency list.
+
+have_plan() { [ -n "$PLAN_JSON" ] && [ -s "$PLAN_JSON" ]; }
+
+# plan_get <index> <field> — prints the value, empty when unavailable.
+plan_get() {
+  have_plan || return 0
+  node "$EXTRACT_SCRIPT" --render "$PLAN_JSON" get "$1" "$2" 2>/dev/null || true
+}
+
+# plan_ytdlp_args <array-name> <index> — fills the array with the yt-dlp args
+# for that candidate. NUL-separated on the wire so URLs and header values
+# survive any quoting. Falls back to the pre-plan behaviour (source page as
+# Referer) whenever there's no usable plan — the extractor may have died
+# before writing one.
+plan_ytdlp_args() {
+  local -n _pargs=$1
+  local index="$2"
+  _pargs=()
+  if have_plan; then
+    while IFS= read -r -d '' a; do
+      _pargs+=("$a")
+    done < <(node "$EXTRACT_SCRIPT" --render "$PLAN_JSON" args "$index" 2>/dev/null)
+  fi
+  if [ ${#_pargs[@]} -eq 0 ]; then
+    debug "No plan args for candidate $index — falling back to page referer"
+    _pargs=(--referer "$URL")
+  fi
+}
+
+# Build a `Cookie: a=b; c=d` header for <url> out of the Netscape jar, so the
+# curl and ffmpeg fallbacks present the same session as yt-dlp does via
+# --cookies. Matches a cookie domain against the host, honouring the leading
+# dot for subdomains.
+cookie_header_for() {
+  local target="$1" host
+  [ -s "$COOKIE_JAR" ] || return 0
+  host=$(printf '%s' "$target" | sed -E 's#^[a-zA-Z]+://([^/]+).*#\1#')
+  host="${host%%:*}"
+  awk -v host="$host" '
+    /^#HttpOnly_/ { sub(/^#HttpOnly_/, "") }
+    /^#/ { next }
+    NF < 7 { next }
+    {
+      d = $1; sub(/^\./, "", d)
+      if (host == d || index(host, "." d) == length(host) - length(d))
+        printf "%s%s=%s", (n++ ? "; " : ""), $6, $7
+    }
+  ' FS='\t' "$COOKIE_JAR"
+}
+
 download_extracted_url() {
   local video_url="$1"
-  local referer="$URL"
+  local index="${2:-0}"
+
+  # Refuse early on real DRM rather than letting yt-dlp grind through
+  # fragments and fail with an opaque error.
+  if [ "$(plan_get "$index" drm)" = "true" ]; then
+    err "DRM-protected content cannot be downloaded"
+    return 1
+  fi
 
   local ytdlp_args=()
   build_ytdlp_args ytdlp_args
-  ytdlp_args+=(--referer "$referer")
+
+  local plan_args=()
+  plan_ytdlp_args plan_args "$index"
+  ytdlp_args+=("${plan_args[@]}")
+
+  # Same identity for the curl / ffmpeg fallbacks: a CDN that checks Referer
+  # usually checks Origin and User-Agent too, and a mismatch between our three
+  # downloaders would make failures impossible to reason about.
+  local referer origin user_agent
+  referer=$(plan_get "$index" referer)
+  [ -n "$referer" ] || referer="$URL"
+  origin=$(plan_get "$index" origin)
+  user_agent=$(plan_get "$index" user_agent)
 
   # When the user didn't pass -o, the generic extractor would use the raw m3u8
   # URL (with query string) as title — that blows past the 255-byte filename
@@ -357,11 +448,18 @@ download_extracted_url() {
     return 0
   fi
 
+  local cookie_hdr
+  cookie_hdr=$(cookie_header_for "$video_url")
+
   # Fallback: direct download with curl for mp4
   if [[ "$video_url" == *.mp4* ]]; then
     local fname="${OUTPUT:-video}.mp4"
     log "Falling back to curl..."
-    curl -L --progress-bar -o "$fname" -e "$referer" "$video_url"
+    local curl_args=(-L --progress-bar -o "$fname" -e "$referer")
+    if [ -n "$user_agent" ]; then curl_args+=(-A "$user_agent"); fi
+    if [ -n "$origin" ]; then curl_args+=(-H "Origin: $origin"); fi
+    if [ -n "$cookie_hdr" ]; then curl_args+=(-H "Cookie: $cookie_hdr"); fi
+    curl "${curl_args[@]}" "$video_url"
     # Verify the downloaded file is actually a video, not HTML
     if file "$fname" 2>/dev/null | grep -qi "html\|text"; then
       warn "Downloaded file is HTML, not a video — URL may be a player page"
@@ -375,7 +473,12 @@ download_extracted_url() {
   if [[ "$video_url" == *m3u8* ]] || [[ "$video_url" == *mpd* ]]; then
     local fname="${OUTPUT:-video}.mp4"
     log "Falling back to ffmpeg..."
-    ffmpeg -y -headers "Referer: ${referer}"$'\r\n' -i "$video_url" -c copy -bsf:a aac_adtstoasc "$fname" 2>&1 | tail -5
+    local hdrs="Referer: ${referer}"$'\r\n'
+    if [ -n "$origin" ]; then hdrs+="Origin: ${origin}"$'\r\n'; fi
+    if [ -n "$cookie_hdr" ]; then hdrs+="Cookie: ${cookie_hdr}"$'\r\n'; fi
+    local ff_args=(-y -headers "$hdrs")
+    if [ -n "$user_agent" ]; then ff_args+=(-user_agent "$user_agent"); fi
+    ffmpeg "${ff_args[@]}" -i "$video_url" -c copy -bsf:a aac_adtstoasc "$fname" 2>&1 | tail -5
     return $?
   fi
 
@@ -389,6 +492,14 @@ main() {
   local url="$URL"
 
   ensure_deps
+
+  # Allocate the plan + cookie-jar paths here rather than inside
+  # extract_with_cdp: that function runs in a command substitution, i.e. a
+  # subshell, where both the assignments and the TMPFILES registration would
+  # be discarded on return.
+  PLAN_JSON=$(mktemp)
+  COOKIE_JAR=$(mktemp)
+  TMPFILES+=("$PLAN_JSON" "$COOKIE_JAR")
 
   # Dry-run mode: extract URLs without downloading
   if $DRY_RUN; then
@@ -417,6 +528,24 @@ main() {
     if [ -n "$extracted" ]; then
       log "URLs from CDP extraction:"
       echo "$extracted"
+
+      # A bare URL is rarely enough: the signed token is bound to the embed
+      # host's Referer, the Chrome UA and the session cookies. Hand the user
+      # the exact command that reproduces what snatch would run.
+      if have_plan; then
+        local cmd
+        cmd=$(node "$EXTRACT_SCRIPT" --render "$PLAN_JSON" cmd 0 2>/dev/null) || cmd=""
+        if [ -n "$cmd" ]; then
+          log "Ready-to-run yt-dlp command:"
+          echo "$cmd"
+        fi
+        log "Full extraction plan (JSON):"
+        cat "$PLAN_JSON"
+        if [ -s "$COOKIE_JAR" ]; then
+          warn "Cookie jar is a temp file deleted on exit: $COOKIE_JAR"
+          warn "Copy it first if you want to run the command above later."
+        fi
+      fi
     fi
     if [ -z "$ytdlp_urls" ] && [ -z "$extracted" ]; then
       err "No video URL found on this page"
@@ -441,11 +570,14 @@ main() {
   fi
 
   # Interactive picker — list every extracted URL and let the user choose.
+  # The index is what matters downstream: plan candidates are emitted in the
+  # same order as these lines, so index N indexes both.
   local best_url
+  local best_index=0
   if $INTERACTIVE; then
     local -a urls=()
     while IFS= read -r line; do
-      [ -n "$line" ] && urls+=("$line")
+      if [ -n "$line" ]; then urls+=("$line"); fi
     done <<< "$extracted"
 
     if [ ${#urls[@]} -eq 0 ]; then
@@ -457,10 +589,23 @@ main() {
       best_url="${urls[0]}"
       log "Only one URL found, using it: $best_url"
     else
+      # Prefer the annotated listing from the plan — format, master/variant,
+      # qualities, HTTP status. A bare URL tells the user nothing about which
+      # server is actually alive.
+      local -a labels=()
+      if have_plan; then
+        while IFS= read -r line; do
+          if [ -n "$line" ]; then labels+=("$line"); fi
+        done < <(node "$EXTRACT_SCRIPT" --render "$PLAN_JSON" list 2>/dev/null)
+      fi
       log "Multiple sources found — pick one to download:"
       local i=1
       for u in "${urls[@]}"; do
-        echo "  [$i] $u" >&2
+        if [ "${#labels[@]}" -ge "$i" ]; then
+          echo "  [$i] ${labels[$((i - 1))]}" >&2
+        else
+          echo "  [$i] $u" >&2
+        fi
         i=$((i + 1))
       done
       local choice
@@ -471,6 +616,7 @@ main() {
         exit 1
       fi
       best_url="${urls[$((choice - 1))]}"
+      best_index=$((choice - 1))
     fi
   else
     # Take the best URL (first line = highest priority)
@@ -480,7 +626,7 @@ main() {
   log "Found video: $best_url"
 
   # Step 3: Download the extracted URL
-  if download_extracted_url "$best_url"; then
+  if download_extracted_url "$best_url" "$best_index"; then
     ok "Download complete!"
     exit 0
   fi
@@ -491,4 +637,8 @@ main() {
   exit 1
 }
 
-main "$@"
+# Sourcing with SNATCH_SOURCE_ONLY=1 loads the functions without running the
+# CLI, so the plan/cookie/header helpers can be unit-tested directly.
+if [ "${SNATCH_SOURCE_ONLY:-}" != "1" ]; then
+  main "$@"
+fi

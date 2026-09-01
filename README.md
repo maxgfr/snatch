@@ -59,7 +59,31 @@ snatch -d 'https://stubborn-site.com/video'
 
 1. **yt-dlp** - tries direct download first (supports YouTube, Twitch, Twitter, and 1800+ sites)
 2. **CDP fallback** - if yt-dlp fails, launches headless Chrome via raw Chrome DevTools Protocol, intercepts network requests to find video URLs (m3u8, mp4, mpd), extracts from player APIs (JWPlayer, Video.js, Plyr, Flowplayer, Clappr, hls.js, dash.js), and auto-clicks consent/play buttons
-3. **Download** - downloads the extracted URL via yt-dlp, curl (mp4), or ffmpeg (m3u8/mpd), with Referer header for CDN compatibility
+3. **Download** - downloads the extracted URL via yt-dlp, curl (mp4), or ffmpeg (m3u8/mpd)
+
+### Why the extracted URL actually works
+
+A signed stream URL is rarely usable on its own: the CDN checks who asked for
+it. So the CDP step doesn't just record the URL, it records how the browser
+fetched it, and replays that:
+
+- **Referer / Origin of the frame that made the request** — on a streaming
+  site that is the embed host (`cloudnestra`, `vidcdn`, …), *not* the page you
+  passed. Sending the page URL is the classic cause of "extraction worked, but
+  the download 403s".
+- **The browser's User-Agent** — Cloudflare's `cf_clearance` and many signed
+  tokens are bound to it.
+- **The session cookie jar**, exported in Netscape format and handed to
+  yt-dlp via `--cookies`.
+- **The real HTTP status** Chrome got, so a URL that already returned 403 in
+  the browser never wins the ranking.
+- **The manifest itself**, read from the response body: this is how snatch
+  prefers a master playlist over a single variant (so `-q` still works),
+  reports DRM up front, and detects when a signed master's children need the
+  query propagated (`--extractor-args generic:variant_query;…`).
+
+`snatch -n` prints all of it: the URLs, a ready-to-paste `yt-dlp` command
+with those headers, and the full JSON plan.
 
 ## Captcha-protected sites
 

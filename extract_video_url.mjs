@@ -2,15 +2,99 @@
 // No Playwright - uses WebSocket directly via ws package
 
 import { execSync, spawn } from 'node:child_process';
-import { readFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, chmodSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import WebSocket from 'ws';
 import { FiltersEngine, Request as AdblockRequest } from '@ghostery/adblocker';
 
+// --- `--render` mode ------------------------------------------------------
+// Pure JSON → yt-dlp rendering. No browser, no temp profile. This exists so
+// download.sh can consume the extraction plan without parsing JSON in bash
+// (and without `jq` becoming a dependency).
+//
+//   node extract_video_url.mjs --render <plan.json> list
+//   node extract_video_url.mjs --render <plan.json> args <index>   (NUL-separated)
+//   node extract_video_url.mjs --render <plan.json> cmd  <index>   (shell one-liner)
+//
+// Must run before anything below touches Chrome or mkdtempSync.
+
+// Wrap for /bin/sh: single-quote everything, escaping embedded single quotes.
+const shQuote = (s) => `'${String(s).replace(/'/g, `'\\''`)}'`;
+
+// One human-readable line per candidate, for the `-i` picker.
+const renderLabel = (c) => {
+  const bits = [];
+  bits.push(c.kind === 'iframe' ? 'iframe' : c.format || 'other');
+  if (c.manifest) bits.push(c.manifest);
+  if (c.qualities?.length) bits.push(c.qualities.slice(0, 4).join('/'));
+  if (c.drm) bits.push('DRM');
+  if (c.verified === 'failed') bits.push(`✗${c.http_status || 'err'}`);
+  else if (c.http_status) bits.push(`✓${c.http_status}`);
+  else bits.push('?');
+  return `[${bits.join(' ')}] ${c.url}`;
+};
+
+if (process.argv[2] === '--render') {
+  const jsonPath = process.argv[3];
+  const mode = process.argv[4];
+  const index = parseInt(process.argv[5] || '0', 10);
+
+  let plan;
+  try {
+    plan = JSON.parse(readFileSync(jsonPath, 'utf8'));
+  } catch (e) {
+    console.error(`RENDER_ERROR: cannot read plan: ${e.message}`);
+    process.exit(1);
+  }
+  const candidates = Array.isArray(plan?.candidates) ? plan.candidates : [];
+
+  if (mode === 'list') {
+    if (candidates.length === 0) {
+      console.error('RENDER_ERROR: no candidates in plan');
+      process.exit(1);
+    }
+    for (const c of candidates) console.log(renderLabel(c));
+    process.exit(0);
+  }
+
+  const c = candidates[index];
+  if (!c) {
+    console.error(`RENDER_ERROR: no candidate at index ${index}`);
+    process.exit(1);
+  }
+  const args = Array.isArray(c.ytdlp_args) ? c.ytdlp_args : [];
+
+  if (mode === 'args') {
+    // NUL-separated so bash can `mapfile -t -d ''` without quoting hazards.
+    process.stdout.write(args.map((a) => a + '\0').join(''));
+    process.exit(0);
+  }
+  if (mode === 'cmd') {
+    console.log(['yt-dlp', ...[...args, c.url].map(shQuote)].join(' '));
+    process.exit(0);
+  }
+  if (mode === 'get') {
+    // Single field lookup, so bash can branch on `drm` / `verified` / … .
+    const field = process.argv[6];
+    // Candidate field first, then plan-level (user_agent, cookie_jar, …).
+    const v = c[field] !== undefined ? c[field] : plan[field];
+    if (v === undefined) {
+      console.error(`RENDER_ERROR: no field "${field}"`);
+      process.exit(1);
+    }
+    console.log(Array.isArray(v) ? v.join(' ') : v === null ? '' : String(v));
+    process.exit(0);
+  }
+
+  console.error(`RENDER_ERROR: unknown mode "${mode}" (list|args|cmd|get)`);
+  process.exit(1);
+}
+
 const url = process.argv[2];
 if (!url) {
   console.error('Usage: node extract_video_url.mjs <URL>');
+  console.error('       node extract_video_url.mjs --render <plan.json> list|args|cmd [index]');
   process.exit(1);
 }
 
@@ -24,6 +108,15 @@ const REFERER = process.env.SNATCH_REFERER || '';
 // the first high-confidence URL. Used by `snatch -a` / `snatch -i` so the
 // user gets fallback URLs when the default server is dead.
 const ALL_SERVERS = process.env.SNATCH_ALL_SERVERS === '1';
+// Where to write the full extraction plan (JSON): every candidate with the
+// request context needed to actually fetch it. download.sh creates the file
+// with mktemp and registers it for cleanup, so we only write into a path the
+// caller already owns — no orphan temp dirs.
+const JSON_OUT = process.env.SNATCH_JSON_OUT || '';
+// Where to export the browser cookie jar (Netscape format) so yt-dlp can
+// replay the session the signed URLs are bound to (cf_clearance, embed
+// session cookies). Same caller-owns-the-path rule as JSON_OUT.
+const COOKIE_JAR_OUT = process.env.SNATCH_COOKIE_JAR || '';
 
 const CHROME_PROFILE = mkdtempSync(join(tmpdir(), 'snatch-chrome-'));
 
@@ -56,6 +149,14 @@ const UA_METADATA = {
 
 const debug = (...args) => {
   if (VERBOSE) console.error('[debug]', ...args);
+};
+
+// Response bodies live in a capped per-target buffer. The defaults are small
+// enough that a busy streaming page can evict a manifest before we get to
+// read it, which would cost us the master-vs-variant signal.
+const NETWORK_ENABLE_PARAMS = {
+  maxTotalBufferSize: 100 * 1024 * 1024,
+  maxResourceBufferSize: 50 * 1024 * 1024,
 };
 
 // --- CDP Client -----------------------------------------------------------
@@ -332,6 +433,52 @@ const isVideoContentType = (ct) =>
   ct.includes('application/x-mpegURL') ||
   ct.includes('application/vnd.apple.mpegurl');
 
+// Looks like a streaming manifest — worth reading the body of.
+const isManifestUrl = (u, ct = '') =>
+  /\.m3u8(\?|$|&)|\.mpd(\?|$|&)/i.test(u) ||
+  /mpegurl|application\/dash/i.test(ct);
+
+// Individual media segments. yt-dlp wants the playlist that lists these, never
+// one of these — a segment URL as the "winner" produces a 4-second file.
+const isSegmentUrl = (u) =>
+  /\/seg-\d+|[/-]chunk[-_]?\d+|\.ts(\?|$|&)|\.m4s(\?|$|&)/i.test(u);
+
+// --- Manifest introspection -----------------------------------------------
+
+// Classify a manifest body. Shared by the passive capture path
+// (Network.getResponseBody) and the live-validation path so both agree on
+// what "master", "variant" and "DRM" mean.
+function classifyManifest(body, contentType = '') {
+  const out = { manifest: null, qualities: [], drm: false };
+  if (!body) return out;
+
+  if (/<MPD[\s>]/i.test(body) || /application\/dash/i.test(contentType)) {
+    out.manifest = 'master';
+    out.drm = /<ContentProtection/i.test(body);
+    const heights = new Set();
+    for (const m of body.matchAll(/\bheight="(\d+)"/gi)) heights.add(parseInt(m[1], 10));
+    out.qualities = [...heights].sort((a, b) => b - a).map((h) => `${h}p`);
+    return out;
+  }
+
+  if (!/#EXTM3U/i.test(body)) return out;
+  if (/#EXT-X-STREAM-INF/i.test(body)) {
+    out.manifest = 'master';
+    const heights = new Set();
+    for (const m of body.matchAll(/RESOLUTION=\d+x(\d+)/gi)) heights.add(parseInt(m[1], 10));
+    out.qualities = [...heights].sort((a, b) => b - a).map((h) => `${h}p`);
+  } else if (/#EXTINF/i.test(body)) {
+    out.manifest = 'variant';
+  }
+  // Plain AES-128 is standard HLS encryption that yt-dlp and ffmpeg handle
+  // fine — only real key systems make a download impossible, so don't cry
+  // DRM on every encrypted stream.
+  out.drm =
+    /#EXT-X-KEY:[^\n]*METHOD=SAMPLE-AES/i.test(body) ||
+    /com\.apple\.streamingkeydelivery|com\.widevine|com\.microsoft\.playready/i.test(body);
+  return out;
+}
+
 // --- DOM extraction script ------------------------------------------------
 
 const DOM_EXTRACT_SCRIPT = `(function() {
@@ -531,6 +678,9 @@ let chromeProc = null;
 
 async function extract() {
   const videoUrls = new Set();
+  // Set when we exhausted the embed chain in-session, so the bash wrapper
+  // doesn't re-follow it in a pristine browser that lacks our cookies.
+  let internalFollowExhausted = false;
 
   // Launch Chrome
   const { proc, wsUrl } = await launchChrome();
@@ -553,8 +703,95 @@ async function extract() {
 
   const send = (method, params = {}) => browser.sendToSession(sessionId, method, params);
 
+  // --- Request context ----------------------------------------------------
+  // The point of the whole handoff: remember HOW the browser fetched each URL,
+  // not just that it did. Referer/Origin belong to the frame that actually
+  // issued the request — for a nested embed that is the embed host, NOT the
+  // page the user typed. Handing yt-dlp the wrong Referer is the classic
+  // "extraction succeeded, download 403s" failure.
+  //
+  // Declared here, above every handler that uses it, so no event can fire
+  // into a temporal dead zone.
+  const reqContext = new Map(); // url → ctx
+  // Keyed by (sessionId, requestId): requestIds are only unique WITHIN a
+  // session, and with OOPIF auto-attach we listen to many sessions at once.
+  // Keying on requestId alone silently cross-wires an iframe's response onto
+  // the top frame's request.
+  const reqById = new Map();
+  // requestWillBeSentExtraInfo can arrive before or after requestWillBeSent,
+  // so headers that land early wait here for their context.
+  const extraInfoPending = new Map();
+  const idKey = (sid, requestId) => `${sid ?? 'top'}:${requestId}`;
+
+  const ctxFor = (u) => {
+    let c = reqContext.get(u);
+    if (!c) {
+      c = {
+        url: u,
+        referer: '',
+        origin: '',
+        frameUrl: '',
+        sessionId: undefined,
+        status: null,
+        contentType: '',
+        manifestBody: null,
+      };
+      reqContext.set(u, c);
+    }
+    return c;
+  };
+
+  // Header names are case-insensitive on the wire and CDP passes them through
+  // as the sender wrote them, so never index headers directly.
+  const header = (headers, name) => {
+    if (!headers) return '';
+    const key = Object.keys(headers).find((k) => k.toLowerCase() === name);
+    return key ? String(headers[key]) : '';
+  };
+
+  const originOf = (u) => {
+    try {
+      return new URL(u).origin;
+    } catch {
+      return '';
+    }
+  };
+
+  // Headers from requestWillBeSentExtraInfo are what Chrome actually put on
+  // the wire, after referrer-policy trimming — they beat anything we inferred
+  // from documentURL, which is only "the document this load belongs to".
+  const applyExtraInfoHeaders = (c, headers) => {
+    const ref = header(headers, 'referer');
+    const org = header(headers, 'origin');
+    if (ref) c.referer = ref;
+    if (org) c.origin = org;
+    else if (ref && !c.origin) c.origin = originOf(ref);
+  };
+
+  const recordRequestContext = (u, { headers, documentURL, sessionId: sid, requestId }) => {
+    if (!u || !/^https?:/i.test(u)) return;
+    const c = ctxFor(u);
+    // First writer wins for the inferred values: the original request is the
+    // one the token was signed against. Extra-info may still overwrite them
+    // below with the authoritative headers.
+    if (!c.referer) c.referer = header(headers, 'referer') || documentURL || '';
+    if (!c.origin) c.origin = header(headers, 'origin') || originOf(c.referer);
+    if (!c.frameUrl && documentURL) c.frameUrl = documentURL;
+    if (c.sessionId === undefined && sid !== undefined) c.sessionId = sid;
+    if (!requestId) return;
+    // A redirect reuses its requestId, so the last hop recorded wins — which
+    // is the hop whose URL we actually hand to yt-dlp.
+    const key = idKey(sid, requestId);
+    reqById.set(key, c);
+    const pending = extraInfoPending.get(key);
+    if (pending) {
+      applyExtraInfoHeaders(c, pending);
+      extraInfoPending.delete(key);
+    }
+  };
+
   // Enable network interception
-  await send('Network.enable');
+  await send('Network.enable', NETWORK_ENABLE_PARAMS);
   await send('Page.enable');
   await send('Runtime.enable');
 
@@ -586,6 +823,15 @@ async function extract() {
       const reqId = params.requestId;
       const reqUrl = params.request?.url || '';
       const resourceType = (params.resourceType || 'other').toLowerCase();
+      // Fetch sees every request with the headers it is about to send, so use
+      // it as a safety net for URLs whose context we'd otherwise miss. Note
+      // Fetch requestIds live in a different namespace from Network ones, so
+      // we deliberately don't index this by requestId. Never affects the
+      // blocking decision below.
+      recordRequestContext(reqUrl, {
+        headers: params.request?.headers,
+        sessionId: sid,
+      });
       // Keep direct media/manifest requests — never block the real video.
       if (resourceType === 'media' ||
           /\.m3u8|\.mpd|mpegurl|master\.m3u8|chunklist/i.test(reqUrl)) {
@@ -626,7 +872,7 @@ async function extract() {
   // which session the event came from.
   browser.on('Target.attachedToTarget', async (params) => {
     const childSid = params.sessionId;
-    try { await browser.sendToSession(childSid, 'Network.enable', {}); } catch {}
+    try { await browser.sendToSession(childSid, 'Network.enable', NETWORK_ENABLE_PARAMS); } catch {}
     try { await browser.sendToSession(childSid, 'Runtime.enable', {}); } catch {}
     try { await browser.sendToSession(childSid, 'Page.enable', {}); } catch {}
     try { await browser.sendToSession(childSid, 'Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: false, flatten: true }); } catch {}
@@ -848,9 +1094,18 @@ async function extract() {
   };
 
   // Collect video URLs from network
-  browser.on('Network.responseReceived', (params) => {
+  browser.on('Network.responseReceived', (params, sid) => {
     const u = params.response?.url || '';
-    const ct = params.response?.headers?.['content-type'] || params.response?.mimeType || '';
+    const ct = header(params.response?.headers, 'content-type') || params.response?.mimeType || '';
+    // Record the real HTTP outcome even for URLs we go on to reject. A 403
+    // seen here is precisely what must never be handed to yt-dlp, and it is
+    // ground truth — no re-fetch can beat it.
+    const byId = reqById.get(idKey(sid, params.requestId));
+    if (byId) {
+      byId.status = params.response?.status ?? null;
+      byId.contentType = ct;
+      if (byId.sessionId === undefined) byId.sessionId = sid;
+    }
     if (isJunk(u)) return;
     // Skip HTML responses even if URL looks like a video (e.g. preview pages)
     if (/text\/html/i.test(ct)) {
@@ -872,12 +1127,51 @@ async function extract() {
     }
   });
 
-  browser.on('Network.requestWillBeSent', (params) => {
+  browser.on('Network.requestWillBeSent', (params, sid) => {
     const u = params.request?.url || '';
     recordInitiator(u, params.initiator);
+    recordRequestContext(u, {
+      headers: params.request?.headers,
+      documentURL: params.documentURL,
+      sessionId: sid,
+      requestId: params.requestId,
+    });
     if (!isJunk(u) && isVideoUrl(u)) {
       debug('Network request:', u);
       videoUrls.add(u);
+    }
+  });
+
+  // Read manifest bodies the moment they finish. CDP evicts response bodies
+  // aggressively, so this cannot wait until scoring time. It gives us
+  // master-vs-variant and the quality list for free, from the exact bytes the
+  // player received — no extra request, no risk of burning a one-shot token.
+  // Authoritative request headers. May arrive before or after the matching
+  // requestWillBeSent, so park them when the context isn't registered yet.
+  browser.on('Network.requestWillBeSentExtraInfo', (params, sid) => {
+    const key = idKey(sid, params.requestId);
+    const c = reqById.get(key);
+    if (c) applyExtraInfoHeaders(c, params.headers);
+    else extraInfoPending.set(key, params.headers);
+  });
+
+  browser.on('Network.loadingFinished', async (params, sid) => {
+    const c = reqById.get(idKey(sid, params.requestId));
+    if (!c || c.manifestBody !== null) return;
+    if (!isManifestUrl(c.url, c.contentType)) return;
+    try {
+      const r = await browser.sendToSession(
+        c.sessionId ?? sid ?? sessionId,
+        'Network.getResponseBody',
+        { requestId: params.requestId },
+        5000
+      );
+      c.manifestBody = r.base64Encoded
+        ? Buffer.from(r.body, 'base64').toString('utf8')
+        : r.body || '';
+      debug('Captured manifest body:', c.url.slice(0, 100), `(${c.manifestBody.length}b)`);
+    } catch (e) {
+      debug('getResponseBody failed:', e.message);
     }
   });
 
@@ -1394,16 +1688,17 @@ async function extract() {
       internalDepth++;
     }
 
-    // Clean up: remove the injected iframe so any later DOM extraction on
-    // the parent page isn't polluted by it.
-    try {
-      await browser.evaluate(sessionId,
-        `(function(){var f=document.getElementById('__snatch_follow_iframe__');if(f)f.parentNode.removeChild(f);return 'ok';})()`);
-    } catch {}
+    // NOTE: the injected iframe is deliberately NOT removed here. Live
+    // validation below re-fetches candidates from the session of the frame
+    // that requested them, and tearing the iframe down now would kill those
+    // sessions — turning every nested-embed URL into "unverified". It is
+    // removed just before teardown instead.
+
     // Tell the bash wrapper not to spawn a new Chrome to follow our top
     // IFRAME: result. We just exhausted that chain in this session — re-doing
     // it in a pristine browser would lose the cookies that the embed token
     // is bound to, and would just fail again.
+    internalFollowExhausted = true;
     console.error('INTERNAL_FOLLOW_EXHAUSTED');
   }
 
@@ -1431,17 +1726,11 @@ async function extract() {
     } catch {}
   }
 
-  // Clean up
-  try {
-    await browser.send('Target.closeTarget', { targetId });
-  } catch {}
-  browser.disconnect();
+  // --- Build the extraction plan ------------------------------------------
+  // Everything from here on needs a LIVE browser session (manifest bodies,
+  // live validation, cookie export), so teardown moved to the very end.
 
-  // Output results — score everything together, emit the winner first.
   const results = [...videoUrls].filter(Boolean);
-  const iframes = results.filter((u) => u.startsWith('IFRAME:'));
-  const videos = results.filter((u) => !u.startsWith('IFRAME:'));
-
   if (results.length === 0) throw new Error('NO_VIDEO_URL_FOUND');
 
   // Page-origin registrable domain (eTLD+1 approximation, good enough for scoring).
@@ -1454,10 +1743,47 @@ async function extract() {
   };
   const pageDomain = etld1(pageHost);
 
+  const formatOf = (u, ct = '') => {
+    const probe = u + ' ' + ct;
+    if (/\.m3u8(\?|$|&)|mpegurl/i.test(probe)) return 'hls';
+    if (/\.mpd(\?|$|&)|application\/dash/i.test(probe)) return 'dash';
+    if (/\.mp4(\?|$|&)|video\/mp4/i.test(probe)) return 'mp4';
+    return 'other';
+  };
+
+  // Fold everything we learned about each URL into one candidate record.
+  // `url` keeps the raw `IFRAME:` prefix so JSON indices line up exactly with
+  // the lines we print on stdout — that's what lets download.sh keep its
+  // existing line-based logic and just ask us for args by index.
+  const candidates = results.map((raw) => {
+    const isIframe = raw.startsWith('IFRAME:');
+    const ctx = (!isIframe && reqContext.get(raw)) || {};
+    const cls = classifyManifest(ctx.manifestBody, ctx.contentType || '');
+    const status = ctx.status ?? null;
+    return {
+      url: raw,
+      kind: isIframe ? 'iframe' : 'video',
+      format: isIframe ? 'other' : formatOf(raw, ctx.contentType || ''),
+      manifest: cls.manifest,
+      qualities: cls.qualities,
+      drm: cls.drm,
+      referer: ctx.referer || '',
+      origin: ctx.origin || '',
+      frame_url: ctx.frameUrl || '',
+      http_status: status,
+      content_type: ctx.contentType || '',
+      verified: status == null ? 'unverified' : status >= 400 ? 'failed' : 'ok',
+      // Internal only — stripped before the JSON is written.
+      _sessionId: ctx.sessionId,
+      _manifestBody: ctx.manifestBody || null,
+    };
+  });
+
   // Score by format + auth-token presence + streaming-path signals + initiator.
   // Signed/tokenized stream URLs from page-origin-initiated requests are almost
   // always the real video; unsigned .mp4 loaded by third-party scripts = ad decoy.
-  const scoreVideo = (u) => {
+  const scoreVideo = (c) => {
+    const u = c.url;
     let s = 0;
     if (/\.m3u8(\?|$|&)|mpegurl/i.test(u)) s += 100;
     else if (/\.mpd(\?|$|&)|dash/i.test(u)) s += 80;
@@ -1475,15 +1801,27 @@ async function extract() {
       else if (initDomains.length > 0 && initDomains.every((d) => d !== pageDomain)) s -= 25;
     }
     if (/\/\d{6,}\.mp4(\?|$)/.test(u) && !/[?&]/.test(u.split('.mp4')[1] || '')) s -= 40;
+
+    // --- Signals from what the browser ACTUALLY got ------------------------
+    // A URL Chrome itself was refused on is dead. Keep it in the list for the
+    // picker and the manual-fallback dump, but never let it win.
+    if (c.verified === 'failed') s -= 200;
+    else if (c.http_status != null) s += 25;
+    // yt-dlp wants the playlist that lists every quality, not one rendition —
+    // handing it a variant silently breaks -q/-f.
+    if (c.manifest === 'master') s += 60;
+    else if (c.manifest === 'variant') s -= 30;
+    // A single media segment is never the answer; it yields a few seconds.
+    if (isSegmentUrl(u)) s -= 150;
     return s;
   };
 
   // Iframes get a baseline score that beats low-confidence ad-like videos
   // (~40) but loses to high-confidence real video URLs (>=100). An embed-host
   // iframe is a reliable path to the real video via recursive extraction.
-  const scoreIframe = (u) => {
+  const scoreIframe = (c) => {
     let s = 70;
-    const raw = u.slice('IFRAME:'.length);
+    const raw = c.url.slice('IFRAME:'.length);
     let host = '';
     try {
       host = new URL(raw, `https://${pageHost}`).hostname;
@@ -1504,12 +1842,246 @@ async function extract() {
     return s;
   };
 
-  const score = (u) => (u.startsWith('IFRAME:') ? scoreIframe(u) : scoreVideo(u));
-  const sorted = results.sort((a, b) => score(b) - score(a));
-  if (VERBOSE) {
-    for (const u of sorted) debug(`score=${score(u)}`, u.slice(0, 130));
+  const score = (c) => (c.kind === 'iframe' ? scoreIframe(c) : scoreVideo(c));
+  const rank = (list) => [...list].sort((a, b) => score(b) - score(a));
+
+  let ranked = rank(candidates);
+
+  // --- Live validation ------------------------------------------------------
+  // Only for candidates the browser never actually fetched (DOM-scraped ones).
+  // When we already have a real status, that IS ground truth — and re-fetching
+  // could burn a one-shot signed token, breaking the very download we're
+  // preparing. We fetch from the session of the frame that owns the URL, so
+  // the Referer Chrome sends here is exactly the one we hand to yt-dlp.
+  const validateCandidate = async (c) => {
+    if (c.kind !== 'video' || c.http_status != null) return;
+    const sid = c._sessionId ?? sessionId;
+    const rangeOnly = c.format === 'mp4' || c.format === 'other';
+    const expr = `(async () => {
+      try {
+        const opts = { credentials: 'include', redirect: 'follow' };
+        ${rangeOnly ? "opts.headers = { Range: 'bytes=0-1' };" : ''}
+        opts.signal = AbortSignal.timeout(6000);
+        const r = await fetch(${JSON.stringify(c.url)}, opts);
+        const body = ${rangeOnly ? "''" : '(await r.text()).slice(0, 65536)'};
+        return JSON.stringify({ status: r.status, ct: r.headers.get('content-type') || '', body });
+      } catch (e) {
+        return JSON.stringify({ status: 0, err: String((e && e.message) || e) });
+      }
+    })()`;
+
+    let out = null;
+    try {
+      out = JSON.parse((await browser.evaluate(sid, expr)) || 'null');
+    } catch (e) {
+      debug('Validation eval failed:', e.message);
+    }
+    // Non-regression rule: only a definite HTTP status may demote a
+    // candidate. A network error, a dead session or a timeout leaves it
+    // "unverified" and unpenalized — we can never do worse than before.
+    if (!out || !out.status) {
+      debug('Validation inconclusive:', c.url.slice(0, 100), out?.err || '');
+      return;
+    }
+    c.http_status = out.status;
+    c.content_type = out.ct || c.content_type;
+    c.verified = out.status >= 400 ? 'failed' : 'ok';
+    if (!c.format || c.format === 'other') c.format = formatOf(c.url, c.content_type);
+    if (out.body) {
+      const cls = classifyManifest(out.body, out.ct || '');
+      if (cls.manifest) {
+        c.manifest = cls.manifest;
+        c.qualities = cls.qualities;
+      }
+      c.drm = c.drm || cls.drm;
+      c._manifestBody = out.body;
+    }
+    debug(`Validated ${c.url.slice(0, 100)} → ${c.verified} (${c.http_status})`);
+  };
+
+  const VALIDATION_BUDGET_MS = 8000;
+  const validationDeadline = Date.now() + VALIDATION_BUDGET_MS;
+  for (const c of ranked.filter((x) => x.kind === 'video').slice(0, 3)) {
+    if (Date.now() > validationDeadline) {
+      debug('Validation budget exhausted');
+      break;
+    }
+    await validateCandidate(c);
   }
-  sorted.forEach((u) => console.log(u));
+
+  ranked = rank(ranked);
+
+  // If the front-runner is a variant playlist and we captured a master whose
+  // body actually lists it, hand yt-dlp the master instead — that is what
+  // makes -q/-f work. Matched on manifest CONTENT only: signed URLs can never
+  // be rebuilt by string surgery on the path.
+  if (ranked[0]?.kind === 'video' && ranked[0].manifest === 'variant') {
+    const variant = ranked[0];
+    let leaf = '';
+    try { leaf = new URL(variant.url).pathname.split('/').filter(Boolean).pop() || ''; } catch {}
+    const master = leaf
+      ? ranked.find(
+          (c) =>
+            c !== variant &&
+            c.manifest === 'master' &&
+            c.verified !== 'failed' &&
+            c._manifestBody &&
+            c._manifestBody.includes(leaf)
+        )
+      : null;
+    if (master) {
+      debug('Promoting master playlist over variant:', master.url.slice(0, 120));
+      ranked = [master, ...ranked.filter((c) => c !== master)];
+    }
+  }
+
+  // --- Cookie jar -----------------------------------------------------------
+  // Export the session the signed URLs are bound to (cf_clearance, embed
+  // session cookies) so yt-dlp can replay it. download.sh owns the path.
+  const exportCookieJar = async () => {
+    if (!COOKIE_JAR_OUT) return '';
+    let cookies = [];
+    try {
+      cookies = (await browser.send('Storage.getCookies', {})).cookies || [];
+    } catch {
+      try {
+        cookies = (await send('Network.getAllCookies', {})).cookies || [];
+      } catch (e) {
+        debug('Cookie export failed:', e.message);
+        return '';
+      }
+    }
+    const lines = [
+      '# Netscape HTTP Cookie File',
+      '# Exported by snatch from the extraction browser session.',
+      '',
+    ];
+    for (const ck of cookies) {
+      if (!ck.name) continue;
+      const value = ck.value ?? '';
+      // A tab or newline in a cookie would corrupt the whole jar for yt-dlp.
+      if (/[\t\n\r]/.test(ck.name + value + (ck.domain || '') + (ck.path || ''))) continue;
+      const domain = ck.domain || '';
+      const includeSub = domain.startsWith('.') ? 'TRUE' : 'FALSE';
+      const expires =
+        ck.session || typeof ck.expires !== 'number' || ck.expires < 0
+          ? 0
+          : Math.floor(ck.expires);
+      lines.push(
+        [
+          (ck.httpOnly ? '#HttpOnly_' : '') + domain,
+          includeSub,
+          ck.path || '/',
+          ck.secure ? 'TRUE' : 'FALSE',
+          String(expires),
+          ck.name,
+          value,
+        ].join('\t')
+      );
+    }
+    try {
+      writeFileSync(COOKIE_JAR_OUT, lines.join('\n') + '\n', 'utf8');
+      chmodSync(COOKIE_JAR_OUT, 0o600); // session cookies — not world-readable
+      debug(`Exported ${cookies.length} cookies to ${COOKIE_JAR_OUT}`);
+      return COOKIE_JAR_OUT;
+    } catch (e) {
+      debug('Cookie jar write failed:', e.message);
+      return '';
+    }
+  };
+  const cookieJar = await exportCookieJar();
+
+  // --- Teardown -------------------------------------------------------------
+  try {
+    await browser.evaluate(
+      sessionId,
+      `(function(){var f=document.getElementById('__snatch_follow_iframe__');if(f)f.parentNode.removeChild(f);return 'ok';})()`
+    );
+  } catch {}
+  try {
+    await browser.send('Target.closeTarget', { targetId });
+  } catch {}
+  browser.disconnect();
+
+  // --- Emit -----------------------------------------------------------------
+  // Everything yt-dlp needs to actually fetch this URL, pre-assembled.
+  // A signed HLS master lists its variants/segments as RELATIVE paths, and
+  // those do NOT inherit the master's signed query. When the CDN expects the
+  // same token on the children, yt-dlp's default ffmpeg path fetches them
+  // bare and gets a 403 mid-download. Detect it from the manifest we actually
+  // read — never guess: forcing query propagation onto children that are
+  // independently signed would invalidate them instead.
+  const needsQueryPropagation = (c) => {
+    if (c.format !== 'hls' || !c._manifestBody) return false;
+    let query = '';
+    try { query = new URL(c.url).search; } catch { return false; }
+    if (!query) return false;
+    return c._manifestBody
+      .split('\n')
+      .map((l) => l.trim())
+      .some((l) => l && !l.startsWith('#') && !/^https?:\/\//i.test(l) && !l.includes('?'));
+  };
+
+  const buildYtdlpArgs = (c) => {
+    const args = [];
+    const ref = c.referer || c.frame_url || url;
+    if (ref) args.push('--referer', ref);
+    args.push('--user-agent', UA_STRING);
+    // yt-dlp splits --add-headers on the first colon, so no space after it.
+    if (c.origin) args.push('--add-headers', `Origin:${c.origin}`);
+    if (cookieJar) args.push('--cookies', cookieJar);
+    if (needsQueryPropagation(c)) {
+      debug('Manifest children are relative and unsigned — propagating query');
+      args.push(
+        '--downloader', 'm3u8:native',
+        '--extractor-args', 'generic:variant_query;fragment_query;key_query'
+      );
+    }
+    return args;
+  };
+
+  if (JSON_OUT) {
+    const plan = {
+      version: 1,
+      page_url: url,
+      user_agent: UA_STRING,
+      cookie_jar: cookieJar,
+      internal_follow_exhausted: internalFollowExhausted,
+      candidates: ranked.map((c) => ({
+        url: c.url,
+        kind: c.kind,
+        score: score(c),
+        format: c.format,
+        manifest: c.manifest,
+        qualities: c.qualities,
+        drm: c.drm,
+        referer: c.referer || c.frame_url || '',
+        origin: c.origin,
+        frame_url: c.frame_url,
+        http_status: c.http_status,
+        content_type: c.content_type,
+        verified: c.verified,
+        ytdlp_args: c.kind === 'video' ? buildYtdlpArgs(c) : [],
+      })),
+    };
+    try {
+      writeFileSync(JSON_OUT, JSON.stringify(plan, null, 2) + '\n', 'utf8');
+      debug('Wrote extraction plan:', JSON_OUT);
+    } catch (e) {
+      debug('Plan write failed:', e.message);
+    }
+  }
+
+  if (VERBOSE) {
+    for (const c of ranked) {
+      debug(
+        `score=${score(c)} [${c.verified}/${c.http_status ?? '-'} ${c.format}${c.manifest ? '/' + c.manifest : ''}]`,
+        c.url.slice(0, 130)
+      );
+    }
+  }
+  // stdout contract is unchanged: one URL per line, best first, IFRAME: kept.
+  ranked.forEach((c) => console.log(c.url));
 }
 
 // --- Cleanup Chrome profile -----------------------------------------------

@@ -429,9 +429,69 @@ PLANEOF2
   run_test "cookie_header_for matches a host-only cookie, ignoring the port" \
     "$(echo "$H2" | grep -q "host_only=v1" && echo true || echo false)"
 
+  # Equal-length unrelated hosts: awk's index() returns 0 when the suffix is
+  # absent, and for two names of the same length length(host)-length(d) is
+  # also 0 — so a naive arithmetic match hands good.com's cookies to evil.com.
+  JF2=$(mktemp)
+  printf '# Netscape HTTP Cookie File\n' > "$JF2"
+  printf '.good.com\tTRUE\t/\tFALSE\t0\tsid\tsecret\n' >> "$JF2"
+  COOKIE_JAR="$JF2"
+  run_test "cookie_header_for does not leak to an equal-length foreign domain" \
+    "$([ -z "$(cookie_header_for "https://evil.com/video.mp4")" ] && echo true || echo false)"
+  run_test "cookie_header_for still matches its own domain" \
+    "$(cookie_header_for "https://www.good.com/video.mp4" | grep -q "sid=secret" && echo true || echo false)"
+
+  # A host-only cookie (includeSubdomains FALSE) must not travel to subdomains.
+  JF3=$(mktemp)
+  printf '# Netscape HTTP Cookie File\n' > "$JF3"
+  printf 'example.com\tFALSE\t/\tFALSE\t0\thostonly\tv\n' >> "$JF3"
+  printf 'secure.test\tFALSE\t/\tTRUE\t0\tsec\tv\n' >> "$JF3"
+  printf 'pathy.test\tFALSE\t/account\tFALSE\t0\tscoped\tv\n' >> "$JF3"
+  COOKIE_JAR="$JF3"
+  run_test "cookie_header_for honours includeSubdomains=FALSE" \
+    "$([ -z "$(cookie_header_for "https://sub.example.com/v.mp4")" ] && echo true || echo false)"
+  run_test "cookie_header_for withholds a Secure cookie over http" \
+    "$([ -z "$(cookie_header_for "http://secure.test/v.mp4")" ] && echo true || echo false)"
+  run_test "cookie_header_for sends a Secure cookie over https" \
+    "$(cookie_header_for "https://secure.test/v.mp4" | grep -q "sec=v" && echo true || echo false)"
+  run_test "cookie_header_for honours the cookie path" \
+    "$([ -z "$(cookie_header_for "https://pathy.test/public/v.mp4")" ] && echo true || echo false)"
+  run_test "cookie_header_for sends within the cookie path" \
+    "$(cookie_header_for "https://pathy.test/account/v.mp4" | grep -q "scoped=v" && echo true || echo false)"
+
   COOKIE_JAR="/nonexistent/jar.txt"
   run_test "cookie_header_for is empty with no jar" \
     "$([ -z "$(cookie_header_for "https://cdn.test/x")" ] && echo true || echo false)"
+
+  # A failed download must never be reported as a completed one. Port 1 on
+  # loopback refuses instantly, so this stays offline and deterministic.
+  DEADPLAN=$(mktemp)
+  cat > "$DEADPLAN" <<'DEADEOF'
+{
+  "version": 1, "page_url": "https://site.test/w", "user_agent": "UA/1.0",
+  "cookie_jar": "", "candidates": [
+    { "url": "http://127.0.0.1:1/video.mp4", "kind": "video", "drm": false,
+      "referer": "https://site.test/w", "origin": "https://site.test",
+      "ytdlp_args": ["--referer", "https://site.test/w"] }
+  ]
+}
+DEADEOF
+  PLAN_JSON="$DEADPLAN"
+  COOKIE_JAR="/nonexistent/jar.txt"
+  OUTPUT="deadtest"
+  DEAD_TMP=$(mktemp -d)
+  # errexit is inherited from download.sh, and a non-zero return is exactly
+  # what this asserts, so it has to be off for the call itself.
+  set +e
+  ( cd "$DEAD_TMP" && download_extracted_url "http://127.0.0.1:1/video.mp4" 0 ) >/dev/null 2>&1
+  DEADRC=$?
+  set -e
+  run_test "a refused mp4 download reports failure, not success" \
+    "$([ "$DEADRC" -ne 0 ] && echo true || echo false)"
+  run_test "a refused mp4 download leaves no stub file behind" \
+    "$([ -z "$(find "$DEAD_TMP" -type f -name 'deadtest.*' 2>/dev/null)" ] && echo true || echo false)"
+  OUTPUT=""
+  rm -rf "$DEAD_TMP" "$DEADPLAN" "$JF2" "$JF3"
 
   rm -f "$PF" "$PF.bad" "$JF"
 

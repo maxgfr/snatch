@@ -722,6 +722,8 @@ async function extract() {
   // so headers that land early wait here for their context.
   const extraInfoPending = new Map();
   const idKey = (sid, requestId) => `${sid ?? 'top'}:${requestId}`;
+  // In-flight Network.getResponseBody reads, so scoring can wait for them.
+  const pendingBodies = new Set();
 
   const ctxFor = (u) => {
     let c = reqContext.get(u);
@@ -757,20 +759,55 @@ async function extract() {
     }
   };
 
+  // DOM-scraped URLs carry no network context of their own, so remember which
+  // frame we scraped them from. Without this, live validation re-fetches them
+  // from the TOP page and sends the wrong Referer — turning a perfectly good
+  // embed URL into a 403 and demoting it below junk.
+  const absorbDomUrls = (list, sid, frameUrl) => {
+    for (const raw of list || []) {
+      if (!raw || isJunk(raw)) continue;
+      if (raw.startsWith('IFRAME:')) {
+        videoUrls.add(raw);
+        continue;
+      }
+      // Players routinely emit relative or protocol-relative sources. Resolve
+      // them against their own frame, or we hand yt-dlp a path with no host.
+      let u = raw;
+      if (frameUrl && !/^https?:\/\//i.test(raw)) {
+        try { u = new URL(raw, frameUrl).toString(); } catch { u = raw; }
+      }
+      videoUrls.add(u);
+      const c = ctxFor(u);
+      if (c.sessionId === undefined && sid !== undefined) c.sessionId = sid;
+      if (!c.frameUrl && frameUrl) c.frameUrl = frameUrl;
+      if (!c.referer && frameUrl) c.referer = frameUrl;
+      if (!c.origin && frameUrl) c.origin = originOf(frameUrl);
+    }
+  };
+
   // Headers from requestWillBeSentExtraInfo are what Chrome actually put on
   // the wire, after referrer-policy trimming — they beat anything we inferred
   // from documentURL, which is only "the document this load belongs to".
   const applyExtraInfoHeaders = (c, headers) => {
     const ref = header(headers, 'referer');
     const org = header(headers, 'origin');
-    if (ref) c.referer = ref;
-    if (org) c.origin = org;
-    else if (ref && !c.origin) c.origin = originOf(ref);
+    // Authoritative, including by its silence: if Chrome sent no Referer
+    // (Referrer-Policy: no-referrer, rel=noreferrer, …) we must NOT invent
+    // one from documentURL. Some CDNs reject a request carrying a Referer
+    // they never issued the token for, so a fabricated header turns a working
+    // URL into a 403.
+    c.referer = ref || '';
+    c.origin = org || (ref ? originOf(ref) : '');
+    c.headersObserved = true;
   };
 
   const recordRequestContext = (u, { headers, documentURL, sessionId: sid, requestId }) => {
     if (!u || !/^https?:/i.test(u)) return;
     const c = ctxFor(u);
+    // Distinguishes "the browser asked for this" from "we scraped it out of
+    // the DOM". Only the latter may be live-validated: re-fetching a request
+    // that is merely still in flight can burn a one-shot signed token.
+    c.requested = true;
     // First writer wins for the inferred values: the original request is the
     // one the token was signed against. Extra-info may still overwrite them
     // below with the authoritative headers.
@@ -1102,8 +1139,14 @@ async function extract() {
     // ground truth — no re-fetch can beat it.
     const byId = reqById.get(idKey(sid, params.requestId));
     if (byId) {
-      byId.status = params.response?.status ?? null;
-      byId.contentType = ct;
+      const st = params.response?.status ?? null;
+      // The same URL can be fetched by several frames. If ANY fetch
+      // succeeded, the URL works — never let a later refusal (a second frame
+      // with a different Referer) overwrite a success and bury a good URL.
+      if (byId.status == null || (byId.status >= 400 && st != null && st < 400)) {
+        byId.status = st;
+        byId.contentType = ct;
+      }
       if (byId.sessionId === undefined) byId.sessionId = sid;
     }
     if (isJunk(u)) return;
@@ -1155,15 +1198,24 @@ async function extract() {
     else extraInfoPending.set(key, params.headers);
   });
 
-  browser.on('Network.loadingFinished', async (params, sid) => {
+  browser.on('Network.loadingFinished', (params, sid) => {
     const c = reqById.get(idKey(sid, params.requestId));
     if (!c || c.manifestBody !== null) return;
     if (!isManifestUrl(c.url, c.contentType)) return;
+    // CDP dispatch does not await handlers, so a body that lands moments
+    // before scoring would otherwise be missed entirely — costing us the
+    // master/variant and DRM signals. Track the read so scoring can wait.
+    const p = readManifestBody(c, params.requestId, sid);
+    pendingBodies.add(p);
+    p.finally(() => pendingBodies.delete(p));
+  });
+
+  async function readManifestBody(c, requestId, sid) {
     try {
       const r = await browser.sendToSession(
         c.sessionId ?? sid ?? sessionId,
         'Network.getResponseBody',
-        { requestId: params.requestId },
+        { requestId },
         5000
       );
       c.manifestBody = r.base64Encoded
@@ -1173,7 +1225,7 @@ async function extract() {
     } catch (e) {
       debug('getResponseBody failed:', e.message);
     }
-  });
+  }
 
 
   // Track page load
@@ -1234,9 +1286,7 @@ async function extract() {
     const earlyResult = await browser.evaluate(sessionId, DOM_EXTRACT_SCRIPT);
     const earlyUrls = JSON.parse(earlyResult || '[]');
     debug('Early DOM extracted:', earlyUrls.length, 'URLs');
-    for (const u of earlyUrls) {
-      if (u && !isJunk(u)) videoUrls.add(u);
-    }
+    absorbDomUrls(earlyUrls, sessionId, url);
   } catch (e) {
     debug('Early DOM extraction error:', e.message);
   }
@@ -1272,9 +1322,7 @@ async function extract() {
     const domResult = await browser.evaluate(sessionId, DOM_EXTRACT_SCRIPT);
     const extracted = JSON.parse(domResult || '[]');
     debug('DOM extracted:', extracted.length, 'URLs');
-    for (const u of extracted) {
-      if (u && !isJunk(u)) videoUrls.add(u);
-    }
+    absorbDomUrls(extracted, sessionId, url);
   } catch (e) {
     console.error('DOM_EXTRACT_ERROR:' + e.message);
   }
@@ -1451,9 +1499,7 @@ async function extract() {
         try {
           const domResult = await browser.evaluate(sessionId, DOM_EXTRACT_SCRIPT);
           const extracted = JSON.parse(domResult || '[]');
-          for (const u of extracted) {
-            if (u && !isJunk(u)) videoUrls.add(u);
-          }
+          absorbDomUrls(extracted, sessionId, url);
         } catch (e) {
           debug('Post-click DOM extract error:', e.message);
         }
@@ -1493,9 +1539,7 @@ async function extract() {
       try {
         const retryResult = await browser.evaluate(sessionId, DOM_EXTRACT_SCRIPT);
         const retryUrls = JSON.parse(retryResult || '[]');
-        for (const u of retryUrls) {
-          if (u && !isJunk(u)) videoUrls.add(u);
-        }
+        absorbDomUrls(retryUrls, sessionId, url);
         if (videoUrls.size > 0) {
           debug('Found URLs on poll attempt', i + 1);
           break;
@@ -1637,9 +1681,9 @@ async function extract() {
             const csid = a.sessionId;
             const value = await browser.evaluate(csid, DOM_EXTRACT_SCRIPT);
             const extracted = JSON.parse(value || '[]');
-            for (const u of extracted) {
-              if (u && !isJunk(u)) videoUrls.add(u);
-            }
+            // ti.url is this iframe's own document: the frame these URLs
+            // belong to, and the Referer their CDN expects.
+            absorbDomUrls(extracted, csid, ti.url);
           } catch {}
         }
       };
@@ -1730,7 +1774,18 @@ async function extract() {
   // Everything from here on needs a LIVE browser session (manifest bodies,
   // live validation, cookie export), so teardown moved to the very end.
 
-  const results = [...videoUrls].filter(Boolean);
+  // Let any manifest body still being read land before we classify anything.
+  if (pendingBodies.size > 0) {
+    debug(`Waiting for ${pendingBodies.size} manifest body read(s)`);
+    await Promise.race([
+      Promise.allSettled([...pendingBodies]),
+      new Promise((r) => setTimeout(r, 3000)),
+    ]);
+  }
+
+  // A URL containing a newline would print as two stdout lines while staying
+  // one plan candidate, desynchronising every index the shell computes.
+  const results = [...videoUrls].filter((u) => u && !/[\r\n]/.test(u));
   if (results.length === 0) throw new Error('NO_VIDEO_URL_FOUND');
 
   // Page-origin registrable domain (eTLD+1 approximation, good enough for scoring).
@@ -1776,6 +1831,7 @@ async function extract() {
       // Internal only — stripped before the JSON is written.
       _sessionId: ctx.sessionId,
       _manifestBody: ctx.manifestBody || null,
+      _requested: !!ctx.requested,
     };
   });
 
@@ -1854,7 +1910,15 @@ async function extract() {
   // preparing. We fetch from the session of the frame that owns the URL, so
   // the Referer Chrome sends here is exactly the one we hand to yt-dlp.
   const validateCandidate = async (c) => {
-    if (c.kind !== 'video' || c.http_status != null) return;
+    // Only URLs the browser never requested. "No status yet" is NOT the same
+    // as "never asked": a request still in flight would be duplicated here,
+    // and a one-shot signed token would be spent on our probe instead of on
+    // the download we are preparing.
+    if (c.kind !== 'video' || c.http_status != null || c._requested) return;
+    // Whether we know the frame this URL belongs to. If we don't, we are
+    // fetching from the top page and sending a Referer the CDN never issued
+    // the token for — so a refusal would say nothing about the URL.
+    const ownSession = c._sessionId !== undefined;
     const sid = c._sessionId ?? sessionId;
     const rangeOnly = c.format === 'mp4' || c.format === 'other';
     const expr = `(async () => {
@@ -1883,6 +1947,13 @@ async function extract() {
       debug('Validation inconclusive:', c.url.slice(0, 100), out?.err || '');
       return;
     }
+    if (out.status >= 400 && !ownSession) {
+      // We had to guess which frame to fetch from, so this refusal is most
+      // likely our own wrong Referer, not a dead URL. Demoting here would
+      // bury a working candidate under ad decoys.
+      debug('Validation 4xx from a guessed frame — inconclusive:', c.url.slice(0, 100));
+      return;
+    }
     c.http_status = out.status;
     c.content_type = out.ct || c.content_type;
     c.verified = out.status >= 400 ? 'failed' : 'ok';
@@ -1901,7 +1972,13 @@ async function extract() {
 
   const VALIDATION_BUDGET_MS = 8000;
   const validationDeadline = Date.now() + VALIDATION_BUDGET_MS;
-  for (const c of ranked.filter((x) => x.kind === 'video').slice(0, 3)) {
+  // Filter BEFORE slicing: otherwise three already-known candidates consume
+  // every slot with instant no-ops and the one URL that actually needs
+  // checking never gets checked.
+  const toValidate = ranked
+    .filter((x) => x.kind === 'video' && x.http_status == null && !x._requested)
+    .slice(0, 3);
+  for (const c of toValidate) {
     if (Date.now() > validationDeadline) {
       debug('Validation budget exhausted');
       break;
@@ -1917,22 +1994,51 @@ async function extract() {
   // be rebuilt by string surgery on the path.
   if (ranked[0]?.kind === 'video' && ranked[0].manifest === 'variant') {
     const variant = ranked[0];
-    let leaf = '';
-    try { leaf = new URL(variant.url).pathname.split('/').filter(Boolean).pop() || ''; } catch {}
-    const master = leaf
-      ? ranked.find(
-          (c) =>
-            c !== variant &&
-            c.manifest === 'master' &&
-            c.verified !== 'failed' &&
-            c._manifestBody &&
-            c._manifestBody.includes(leaf)
-        )
-      : null;
+    // Resolve each playlist entry against its own master and compare
+    // origin+path. Matching on the basename alone would promote an unrelated
+    // master from another host that happens to also list a "720.m3u8".
+    const sameResource = (a, b) => {
+      try {
+        const x = new URL(a);
+        const y = new URL(b);
+        return x.origin === y.origin && x.pathname === y.pathname;
+      } catch {
+        return false;
+      }
+    };
+    const masterLists = (m, variantUrl) =>
+      !!m._manifestBody &&
+      m._manifestBody
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith('#'))
+        .some((l) => {
+          try { return sameResource(new URL(l, m.url).toString(), variantUrl); } catch { return false; }
+        });
+    const master = ranked.find(
+      (c) =>
+        c !== variant &&
+        c.manifest === 'master' &&
+        c.verified !== 'failed' &&
+        masterLists(c, variant.url)
+    );
     if (master) {
       debug('Promoting master playlist over variant:', master.url.slice(0, 120));
       ranked = [master, ...ranked.filter((c) => c !== master)];
     }
+  }
+
+  // A score penalty only makes a bad candidate unlikely to win; it does not
+  // make it impossible. Something we KNOW is broken — the browser was refused
+  // on it, or it is a lone media segment worth four seconds — must never be
+  // handed over as the answer. Keep them listed for the picker and the manual
+  // fallback dump, just never first.
+  const isDisqualified = (c) =>
+    c.kind === 'video' && (c.verified === 'failed' || isSegmentUrl(c.url));
+  const usable = ranked.filter((c) => !isDisqualified(c));
+  if (usable.length > 0 && usable.length < ranked.length) {
+    debug(`Demoting ${ranked.length - usable.length} disqualified candidate(s)`);
+    ranked = [...usable, ...ranked.filter(isDisqualified)];
   }
 
   // --- Cookie jar -----------------------------------------------------------
@@ -1980,8 +2086,10 @@ async function extract() {
       );
     }
     try {
-      writeFileSync(COOKIE_JAR_OUT, lines.join('\n') + '\n', 'utf8');
-      chmodSync(COOKIE_JAR_OUT, 0o600); // session cookies — not world-readable
+      // mode on create closes the window where a fresh jar would sit
+      // world-readable under the default umask before the chmod lands.
+      writeFileSync(COOKIE_JAR_OUT, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+      chmodSync(COOKIE_JAR_OUT, 0o600); // and enforce it on a pre-existing file
       debug(`Exported ${cookies.length} cookies to ${COOKIE_JAR_OUT}`);
       return COOKIE_JAR_OUT;
     } catch (e) {
@@ -2016,10 +2124,27 @@ async function extract() {
     let query = '';
     try { query = new URL(c.url).search; } catch { return false; }
     if (!query) return false;
-    return c._manifestBody
+    const children = c._manifestBody
       .split('\n')
       .map((l) => l.trim())
-      .some((l) => l && !l.startsWith('#') && !/^https?:\/\//i.test(l) && !l.includes('?'));
+      .filter((l) => l && !l.startsWith('#'));
+    let relativeUnqueried = false;
+    for (const child of children) {
+      if (/^https?:\/\//i.test(child) || child.includes('?')) continue;
+      relativeUnqueried = true;
+      // Counter-evidence beats the heuristic: if the browser itself fetched
+      // this child WITHOUT the query and got a 2xx, the children plainly do
+      // not need it, and forcing it on (e.g. cookie-authorised children that
+      // reject unknown params) would break a download that works.
+      let abs;
+      try { abs = new URL(child, c.url).toString(); } catch { continue; }
+      const seen = reqContext.get(abs);
+      if (seen && seen.status != null && seen.status < 400) {
+        debug('Children fetched fine without the query — not propagating');
+        return false;
+      }
+    }
+    return relativeUnqueried;
   };
 
   const buildYtdlpArgs = (c) => {

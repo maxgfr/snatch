@@ -34,6 +34,15 @@ Two files: a bash orchestrator and a Node.js CDP extractor.
 - **Live validation** — only for candidates the browser never fetched (DOM-scraped). A captured status is ground truth, and re-fetching can burn a one-shot signed token. Fetched from the owning frame's session so the Referer matches the handoff. Only a definite 4xx/5xx demotes; anything else stays `unverified` and unpenalized
 - **Cookie jar** (`SNATCH_COOKIE_JAR`) — Netscape format, 7 tab-separated fields, `#HttpOnly_` domain prefix, `0` for session cookies, chmod 600. `download.sh` owns the path (mktemp + TMPFILES), so the extractor never leaves temp files behind
 - **`--render` mode** — `node extract_video_url.mjs --render <plan.json> list|args|cmd|get [index] [field]`. Pure, no browser. Keeps `jq` out of the dependency list: `args` is NUL-separated for `read -r -d ''`, `cmd` is shell-quoted for humans
+
+#### Invariants worth not breaking
+
+- **Never fabricate a header.** If `requestWillBeSentExtraInfo` shows Chrome sent no Referer, the plan must send none: some CDNs reject a Referer they never issued the token for. `documentURL` is context, NOT the Referer
+- **Only a definite HTTP status may demote a candidate**, and only when it came from that URL's own frame session. A 4xx obtained from a guessed frame is our wrong Referer, not a dead URL
+- **Only ever live-validate URLs the browser never requested** (`ctx.requested`). "No status yet" also means "response still in flight", and re-fetching would spend a one-shot signed token on the probe
+- **A penalty is not a disqualification.** Candidates known broken (4xx, lone segment) are force-demoted below every usable one after scoring; DRM candidates are skipped by `download.sh` in favour of a clear stream ranked lower
+- **stdout lines and plan candidates must stay index-aligned** — URLs containing newlines are dropped for exactly this reason
+- **Known limitation**: redirect hops reuse one `requestId`, and both `reqById` and `extraInfoPending` hold a single entry per key, so a delayed ExtraInfo event for hop A can attach to hop B. Correlating properly needs FIFO arrays per requestId, as devtools-frontend does
 - Cookie injection: parses Netscape-format cookie files, injects via `Network.setCookie`
 - Network interception: `Network.responseReceived` + `Network.requestWillBeSent`
 - Smart page load: waits for `Page.loadEventFired` (with TIMEOUT fallback) + 2s grace period

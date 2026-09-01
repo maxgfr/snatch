@@ -82,8 +82,14 @@ fetched it, and replays that:
   reports DRM up front, and detects when a signed master's children need the
   query propagated (`--extractor-args generic:variant_query;…`).
 
-`snatch -n` prints all of it: the URLs, a ready-to-paste `yt-dlp` command
-with those headers, and the full JSON plan.
+`snatch -n` prints all of it: the URLs, a ready-to-paste `yt-dlp` command with
+those headers, and the full JSON plan. Dry-run deliberately keeps the exported
+cookie jar on disk (and says where) so that command still works later — delete
+it when you're done, it holds live session cookies.
+
+A DRM-protected stream is reported rather than attempted, and if one happens to
+rank first, snatch falls through to the best clear stream below it instead of
+giving up.
 
 ## Captcha-protected sites
 

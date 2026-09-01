@@ -35,6 +35,7 @@ INTERACTIVE=false
 # assignment made there would be lost.
 PLAN_JSON=""
 COOKIE_JAR=""
+CDP_STDERR=""
 
 # --- Cleanup ---------------------------------------------------------------
 
@@ -212,9 +213,12 @@ extract_with_cdp() {
   local url="$1"
   log "yt-dlp failed, extracting video URL with CDP..."
 
-  local stderr_output
-  stderr_output=$(mktemp)
-  TMPFILES+=("$stderr_output")
+  # Reuse the caller-owned scratch file. A mktemp here would be registered in
+  # TMPFILES inside a command-substitution subshell, so the EXIT trap would
+  # never see it and the file — which holds verbose signed URLs — would be
+  # left in /tmp. Each `2>` redirection truncates, so one file serves every hop.
+  local stderr_output="${CDP_STDERR:-}"
+  if [ -z "$stderr_output" ]; then stderr_output=$(mktemp); fi
 
   local env_args=()
   if $VERBOSE; then env_args+=(SNATCH_VERBOSE=1); fi
@@ -315,9 +319,8 @@ extract_with_cdp() {
       iframe_url="${base}${iframe_url}"
     fi
     warn "Following iframe (depth $((depth+1))): $iframe_url"
-    local next_stderr
-    next_stderr=$(mktemp)
-    TMPFILES+=("$next_stderr")
+    # Same file, truncated per hop — see the note above about subshell TMPFILES.
+    local next_stderr="$stderr_output"
     # Build a fresh env-arg array that also includes SNATCH_REFERER, so embed
     # hosts (cloudnestra, vidsrc, streamtape, …) that enforce referer checks
     # or Cloudflare challenges don't 403 the recursion.
@@ -391,18 +394,35 @@ plan_ytdlp_args() {
 # --cookies. Matches a cookie domain against the host, honouring the leading
 # dot for subdomains.
 cookie_header_for() {
-  local target="$1" host
+  local target="$1" host scheme path
   [ -s "$COOKIE_JAR" ] || return 0
+  scheme=$(printf '%s' "$target" | sed -E 's#^([a-zA-Z]+)://.*#\1#')
   host=$(printf '%s' "$target" | sed -E 's#^[a-zA-Z]+://([^/]+).*#\1#')
   host="${host%%:*}"
-  awk -v host="$host" '
+  path=$(printf '%s' "$target" | sed -E 's#^[a-zA-Z]+://[^/]*##; s#[?#].*##')
+  [ -n "$path" ] || path="/"
+  awk -v host="$host" -v scheme="$scheme" -v path="$path" '
     /^#HttpOnly_/ { sub(/^#HttpOnly_/, "") }
     /^#/ { next }
     NF < 7 { next }
     {
       d = $1; sub(/^\./, "", d)
-      if (host == d || index(host, "." d) == length(host) - length(d))
-        printf "%s%s=%s", (n++ ? "; " : ""), $6, $7
+      ok = 0
+      if (host == d) {
+        ok = 1
+      } else if ($2 == "TRUE") {
+        # Parent-domain match, and ONLY when the cookie opted into
+        # subdomains. index() returns 0 when the suffix is absent, which for
+        # two equal-length names also equals length(host)-length(d) — that
+        # arithmetic alone would hand good.com cookies to evil.com.
+        pos = index(host, "." d)
+        if (pos > 0 && pos == length(host) - length(d)) ok = 1
+      }
+      if (!ok) next
+      if ($4 == "TRUE" && scheme != "https") next   # Secure: https only
+      p = $3; if (p == "") p = "/"
+      if (substr(path, 1, length(p)) != p) next     # path prefix, RFC 6265
+      printf "%s%s=%s", (n++ ? "; " : ""), $6, $7
     }
   ' FS='\t' "$COOKIE_JAR"
 }
@@ -459,14 +479,21 @@ download_extracted_url() {
     if [ -n "$user_agent" ]; then curl_args+=(-A "$user_agent"); fi
     if [ -n "$origin" ]; then curl_args+=(-H "Origin: $origin"); fi
     if [ -n "$cookie_hdr" ]; then curl_args+=(-H "Cookie: $cookie_hdr"); fi
-    curl "${curl_args[@]}" "$video_url"
+    # `return $?` after the file-type check would return the *if statement's*
+    # status, which is 0 when the check simply doesn't match — so a failed
+    # curl used to be reported as a completed download.
+    if ! curl "${curl_args[@]}" "$video_url"; then
+      warn "curl failed to download the URL"
+      rm -f "$fname"
+      return 1
+    fi
     # Verify the downloaded file is actually a video, not HTML
     if file "$fname" 2>/dev/null | grep -qi "html\|text"; then
       warn "Downloaded file is HTML, not a video — URL may be a player page"
       rm -f "$fname"
       return 1
     fi
-    return $?
+    return 0
   fi
 
   # Fallback: ffmpeg for m3u8/mpd
@@ -499,7 +526,13 @@ main() {
   # be discarded on return.
   PLAN_JSON=$(mktemp)
   COOKIE_JAR=$(mktemp)
-  TMPFILES+=("$PLAN_JSON" "$COOKIE_JAR")
+  CDP_STDERR=$(mktemp)
+  TMPFILES+=("$PLAN_JSON" "$CDP_STDERR")
+  # In dry-run the whole point is a command the user can paste later, so the
+  # jar it references has to outlive us. Everywhere else it is scratch.
+  if ! $DRY_RUN; then
+    TMPFILES+=("$COOKIE_JAR")
+  fi
 
   # Dry-run mode: extract URLs without downloading
   if $DRY_RUN; then
@@ -542,8 +575,8 @@ main() {
         log "Full extraction plan (JSON):"
         cat "$PLAN_JSON"
         if [ -s "$COOKIE_JAR" ]; then
-          warn "Cookie jar is a temp file deleted on exit: $COOKIE_JAR"
-          warn "Copy it first if you want to run the command above later."
+          warn "Session cookies kept at $COOKIE_JAR so the command above still works."
+          warn "It holds live session cookies — delete it when you're done."
         fi
       fi
     fi
@@ -619,8 +652,27 @@ main() {
       best_index=$((choice - 1))
     fi
   else
-    # Take the best URL (first line = highest priority)
-    best_url=$(echo "$extracted" | head -1)
+    # Take the best URL (first line = highest priority). Parameter expansion
+    # rather than `echo | head -1`: under `set -o pipefail` head closing the
+    # pipe early makes echo die of SIGPIPE and the assignment return 141.
+    best_url="${extracted%%$'\n'*}"
+    # Skip candidates the plan flagged as DRM. Failing on the top one would
+    # hide a perfectly downloadable clear stream ranked just below it.
+    if have_plan; then
+      local n=0 chosen=""
+      while IFS= read -r cand; do
+        if [ -n "$cand" ] && [ "$(plan_get "$n" drm)" != "true" ]; then
+          chosen="$cand"
+          best_index="$n"
+          break
+        fi
+        if [ -n "$cand" ]; then
+          warn "Skipping DRM-protected candidate $((n + 1))"
+        fi
+        n=$((n + 1))
+      done <<< "$extracted"
+      if [ -n "$chosen" ]; then best_url="$chosen"; fi
+    fi
   fi
 
   log "Found video: $best_url"

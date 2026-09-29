@@ -6,6 +6,6 @@
   "author": "maxgfr",
   "dependencies": {
     "@ghostery/adblocker": "^2.12.0",
-    "ws": "^8.18.0"
+    "ws": "^8.20.1"
   }
 }
